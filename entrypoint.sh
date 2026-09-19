@@ -28,4 +28,4 @@ fi
 echo "=========================================================="
 echo "=== 2. STARTING AUTOSUB-AI FASTAPI / UVICORN SERVER ==="
 echo "=========================================================="
-exec /venv/main/bin/uvicorn app:app --host 0.0.0.0 --port 10100 --workers 1
+exec /opt/conda/bin/uvicorn app:app --host 0.0.0.0 --port 8080 --workers 1
