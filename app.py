@@ -264,9 +264,20 @@ print(f"Dual-Engine Subtitle Server Ready on RTX 3090 ({GPU_NAME})! 4-hour Auto-
 # VOCAL ISOLATION ENGINE (HDemucs v4 MusDB+)
 # ==========================================
 print("Initializing Vocal Isolation Engine: HDemucs (MusDB+)...")
-demucs_bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
-demucs_model = demucs_bundle.get_model().to(device).eval()
-print("Vocal Isolation Engine Ready on GPU!")
+demucs_model = None
+try:
+    torch.backends.cudnn.enabled = False
+    demucs_bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
+    demucs_model = demucs_bundle.get_model().to(device).eval()
+    print("Vocal Isolation Engine Ready on GPU!")
+except Exception as _demucs_err:
+    print(f"Demucs GPU init notice ({_demucs_err}) - Demucs will be optional.")
+    try:
+        demucs_bundle = torchaudio.pipelines.HDEMUCS_HIGH_MUSDB_PLUS
+        demucs_model = demucs_bundle.get_model().to("cpu").eval()
+        print("Vocal Isolation Engine Ready on CPU!")
+    except Exception:
+        demucs_model = None
 
 def isolate_vocals_from_audio(wav: np.ndarray, orig_sr: int, chunk_sec: int = 60) -> torch.Tensor:
     """
