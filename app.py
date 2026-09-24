@@ -41,6 +41,14 @@ def _patched_hf_download(*args, **kwargs):
     return _orig_hf_download(*args, **kwargs)
 huggingface_hub.hf_hub_download = _patched_hf_download
 
+try:
+    import pyannote.audio.core.pipeline
+    pyannote.audio.core.pipeline.hf_hub_download = _patched_hf_download
+    import pyannote.audio.core.model
+    pyannote.audio.core.model.hf_hub_download = _patched_hf_download
+except Exception:
+    pass
+
 app = FastAPI(title="Dual-Engine Subtitle API (Typhoon Thai + Whisper Multilingual)", version="2.0.0")
 
 app.add_middleware(
@@ -200,7 +208,13 @@ def run_speaker_diarization(
     if max_speakers is not None and int(max_speakers) > 0:
         kwargs["max_speakers"] = int(max_speakers)
     try:
-        diarization = pipeline(audio_path, **kwargs)
+        orig_cudnn = torch.backends.cudnn.enabled
+        torch.backends.cudnn.enabled = False
+        try:
+            diarization = pipeline(audio_path, **kwargs)
+        finally:
+            torch.backends.cudnn.enabled = orig_cudnn
+
         turns = []
         for turn, _, speaker in diarization.itertracks(yield_label=True):
             turns.append({
