@@ -29,6 +29,18 @@ from pythainlp.corpus.common import thai_words
 from faster_whisper import WhisperModel as FasterWhisperModel
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 
+# Patch huggingface_hub for pyannote.audio compatibility (use_auth_token -> token)
+import huggingface_hub
+_orig_hf_download = huggingface_hub.hf_hub_download
+def _patched_hf_download(*args, **kwargs):
+    if "use_auth_token" in kwargs:
+        if "token" not in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+        else:
+            kwargs.pop("use_auth_token")
+    return _orig_hf_download(*args, **kwargs)
+huggingface_hub.hf_hub_download = _patched_hf_download
+
 app = FastAPI(title="Dual-Engine Subtitle API (Typhoon Thai + Whisper Multilingual)", version="2.0.0")
 
 app.add_middleware(
@@ -57,7 +69,7 @@ logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 # AUTO-SLEEP & WATCHDOG CONFIGURATION
 # ==========================================
 IDLE_TIMEOUT_SECONDS = 14400  # 4 hours idle limit
-INSTANCE_ID = "51322461"
+INSTANCE_ID = os.environ.get("CONTAINER_ID") or "51401126"
 try:
     if os.path.exists("/root/.vast_containerlabel"):
         with open("/root/.vast_containerlabel", "r") as _f:
@@ -66,7 +78,7 @@ try:
                 INSTANCE_ID = _cid
 except Exception:
     pass
-VAST_API_KEY_DEFAULT = "bb158182f28dba3c4d30c71fd31eca1149c65b308b7f59ead54c0a5c66332a5d"
+VAST_API_KEY_DEFAULT = os.environ.get("VAST_API_KEY", "")
 
 state_lock = threading.Lock()
 last_active_time = time.time()
@@ -122,6 +134,114 @@ def log_transcribe(msg: str, filename: str = None):
     except Exception as ex:
         print(f"Log write error: {ex}", flush=True)
 
+# ==========================================
+# SPEAKER DIARIZATION (pyannote.audio)
+# ==========================================
+diarization_pipeline = None
+diarization_lock = threading.Lock()
+
+def get_diarization_pipeline(hf_token: Optional[str] = None):
+    global diarization_pipeline
+    with diarization_lock:
+        if diarization_pipeline is not None:
+            return diarization_pipeline
+        token = (
+            (hf_token.strip() if hf_token else None) or
+            os.environ.get("HF_TOKEN") or
+            os.environ.get("HUGGINGFACE_TOKEN")
+        )
+        if not token:
+            token_file = os.path.expanduser("~/.cache/huggingface/token")
+            if os.path.exists(token_file):
+                try:
+                    with open(token_file, "r") as tf:
+                        token = tf.read().strip()
+                except Exception:
+                    pass
+
+        try:
+            from pyannote.audio import Pipeline
+            log_transcribe("[DIARIZATION] กำลังโหลดโมเดล pyannote/speaker-diarization-3.1...")
+            try:
+                pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    token=token
+                )
+            except TypeError:
+                pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=token
+                )
+            if pipeline:
+                if torch.cuda.is_available():
+                    pipeline = pipeline.to(torch.device("cuda"))
+                diarization_pipeline = pipeline
+                log_transcribe("[DIARIZATION] pyannote pipeline โหลดขึ้น GPU สำเร็จ!")
+            return diarization_pipeline
+        except Exception as e:
+            log_transcribe(f"[DIARIZATION ERROR] ไม่สามารถโหลด pyannote pipeline ได้: {e}")
+            return None
+
+def run_speaker_diarization(
+    audio_path: str,
+    hf_token: Optional[str] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None
+):
+    pipeline = get_diarization_pipeline(hf_token)
+    if not pipeline:
+        return []
+    t0 = time.time()
+    fname = os.path.basename(audio_path)
+    log_transcribe(f"[DIARIZATION] กำลังวิเคราะห์แยกเสียงผู้พูดสำหรับไฟล์: {fname}...")
+    kwargs = {}
+    if min_speakers is not None and int(min_speakers) > 0:
+        kwargs["min_speakers"] = int(min_speakers)
+    if max_speakers is not None and int(max_speakers) > 0:
+        kwargs["max_speakers"] = int(max_speakers)
+    try:
+        diarization = pipeline(audio_path, **kwargs)
+        turns = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            turns.append({
+                "start": round(turn.start, 3),
+                "end": round(turn.end, 3),
+                "speaker": speaker
+            })
+        elapsed = round(time.time() - t0, 2)
+        spk_count = len(set(t["speaker"] for t in turns))
+        log_transcribe(f"[DIARIZATION SUCCESS] พบ {len(turns)} ช่วงพูด จากผู้พูด {spk_count} คน (ใช้เวลา {elapsed}s)")
+        return turns
+    except Exception as e:
+        log_transcribe(f"[DIARIZATION ERROR] ล้มเหลวขณะประมวลผล Diarization: {e}")
+        return []
+
+def assign_speakers_to_segments(segments, speaker_turns):
+    if not speaker_turns or not segments:
+        return segments
+    for seg in segments:
+        s_start = seg.get("start", 0.0)
+        s_end = seg.get("end", 0.0)
+        best_spk = None
+        max_overlap = 0.0
+        for turn in speaker_turns:
+            overlap_start = max(s_start, turn["start"])
+            overlap_end = min(s_end, turn["end"])
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap > max_overlap:
+                max_overlap = overlap
+                best_spk = turn["speaker"]
+        # If no direct overlap, pick the nearest speaker turn within 0.5s
+        if not best_spk:
+            min_dist = 9999.0
+            for turn in speaker_turns:
+                dist = min(abs(s_start - turn["end"]), abs(s_end - turn["start"]))
+                if dist < min_dist and dist < 0.5:
+                    min_dist = dist
+                    best_spk = turn["speaker"]
+        seg["speaker"] = best_spk or "SPEAKER_00"
+    return segments
+
 def update_activity():
     global last_active_time
     with state_lock:
@@ -159,7 +279,7 @@ def trigger_auto_sleep():
 
         if api_key:
             import urllib.request
-            url = f"https://console.vast.ai/api/v0/instances/{INSTANCE_ID}/"
+            url = f"https://console.vast.ai/api/v1/instances/{INSTANCE_ID}/"
             payload = json.dumps({"state": "stopped"}).encode("utf-8")
             req = urllib.request.Request(
                 url,
@@ -472,12 +592,12 @@ DEFAULT_DRAMA_PROMPT = (
 )
 
 
-def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = -0.55, max_cue_dur: float = 5.0):
+def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = 0.0, max_cue_dur: float = 5.0):
     segments = []
     curr = []
     seg_id = 0
 
-    # Shift words earlier by time_offset to eliminate the ~1s audio-to-subtitle lag
+    # Apply time_offset (default 0.0s for sample-accurate WAV/audio alignment)
     shifted_words = []
     for w in all_words:
         s = max(0.0, round(w["start"] + time_offset, 3))
@@ -546,7 +666,7 @@ def format_timestamp(seconds: float, vtt: bool = False) -> str:
     sep = "." if vtt else ","
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{msecs:03d}"
 
-def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = False):
+def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = False, time_offset: float = 0.0):
     """
     End-to-End Thai Transcription & Alignment via Typhoon CTC:
     1. Vocal Isolation (HDemucs) -> optional BGM removal
@@ -672,7 +792,7 @@ def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pa
                 })
                 k += len(w)
 
-    segments = form_dialogue_segments(all_words, max_chars_per_cue, max_pause_sec, min_cue_dur)
+    segments = form_dialogue_segments(all_words, max_chars_per_cue, max_pause_sec, min_cue_dur, time_offset=time_offset)
     full_text = " ".join(s["text"] for s in segments)
     return segments, full_text, total_duration
 
@@ -683,7 +803,7 @@ def transcribe_with_turbo_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = -0.55,
+    time_offset: float = 0.0,
 ):
     """
     End-to-End Thai Transcription & Alignment via Whisper large-v3-turbo:
@@ -799,7 +919,7 @@ def transcribe_hybrid_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = -0.55,
+    time_offset: float = 0.0,
 ):
     """
     Hybrid Pipeline: Turbo for transcription + Typhoon CTC for 20ms alignment.
@@ -1157,16 +1277,20 @@ def do_transcription_pipeline(
     isolate_vocals: Optional[bool],
     time_offset: Optional[float],
     start_ts: float,
-    file_size_mb: float
+    file_size_mb: float,
+    diarize: Optional[bool] = False,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    hf_token: Optional[str] = None
 ):
     lang_code = (language or "th").strip().lower()
     req_model = (model_name or "auto").strip().lower()
-    offset_val = -0.55 if time_offset is None else float(time_offset)
+    offset_val = 0.0 if time_offset is None else float(time_offset)
 
     if req_model in ["typhoon", "typhoon-ctc"]:
         engine_label = "Typhoon-Whisper-CTC" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
-        segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals)
+        segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals, time_offset=offset_val)
         detected_lang = "th"
     elif req_model == "hybrid" or (req_model == "auto" and lang_code in ["th", "thai", "t1"]):
         engine_label = f"Hybrid (Turbo + Typhoon CTC Align, Offset: {offset_val}s)"
@@ -1219,10 +1343,24 @@ def do_transcription_pipeline(
         audio_dur = round(info.duration, 2)
         detected_lang = info.language
 
+    # Speaker Diarization via pyannote.audio
+    if diarize:
+        try:
+            speaker_turns = run_speaker_diarization(
+                tmp_path,
+                hf_token=hf_token,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers
+            )
+            if speaker_turns:
+                segments = assign_speakers_to_segments(segments, speaker_turns)
+        except Exception as _d_err:
+            log_transcribe(f"[DIARIZATION NOTICE] Skipped due to error: {_d_err}")
+
     infer_sec = round(time.time() - start_ts, 2)
     speedup = round(audio_dur / infer_sec, 1) if infer_sec > 0 else 0
 
-    log_transcribe(f"[SUCCESS] ความยาวเสียง: {audio_dur}s | เวลาถอดเสียง: {infer_sec}s ({speedup}x เท่า) | จำนวนท่อน: {len(segments)} segments")
+    log_transcribe(f"[SUCCESS] ความยาวเสียง: {audio_dur}s | เวลาถอดเสียง: {infer_sec}s ({speedup}x เท่า) | จำนวนท่อน: {len(segments)} segments" + (" [Diarized]" if diarize else ""))
     if combined_text:
         preview = combined_text[:100] + ("..." if len(combined_text) > 100 else "")
         log_transcribe(f"[PREVIEW] \"{preview}\"")
@@ -1232,7 +1370,12 @@ def do_transcription_pipeline(
         vtt_lines = ["WEBVTT\n"]
         for s in segments:
             vtt_lines.append(f"{format_timestamp(s['start'], vtt=True)} --> {format_timestamp(s['end'], vtt=True)}")
-            vtt_lines.append(f"{s['text']}\n")
+            spk = s.get("speaker")
+            txt = s.get("text", "")
+            if spk:
+                vtt_lines.append(f"<v {spk}>{txt}\n")
+            else:
+                vtt_lines.append(f"{txt}\n")
         return PlainTextResponse("\n".join(vtt_lines), media_type="text/vtt; charset=utf-8")
 
     elif fmt == "srt":
@@ -1240,7 +1383,12 @@ def do_transcription_pipeline(
         for i, s in enumerate(segments, 1):
             srt_lines.append(str(i))
             srt_lines.append(f"{format_timestamp(s['start'], vtt=False)} --> {format_timestamp(s['end'], vtt=False)}")
-            srt_lines.append(f"{s['text']}\n")
+            spk = s.get("speaker")
+            txt = s.get("text", "")
+            if spk:
+                srt_lines.append(f"[{spk}]: {txt}\n")
+            else:
+                srt_lines.append(f"{txt}\n")
         return PlainTextResponse("\n".join(srt_lines), media_type="text/plain; charset=utf-8")
 
     elif fmt == "text":
@@ -1269,21 +1417,31 @@ def async_webhook_worker(
     file_size_mb: float,
     webhook_url: str,
     webhook_secret: Optional[str],
-    custom_id: Optional[str]
+    custom_id: Optional[str],
+    diarize: Optional[bool] = False,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    hf_token: Optional[str] = None
 ):
     global active_jobs, total_jobs_completed, last_active_time
     token = current_file_ctx.set(orig_filename)
     try:
         res = do_transcription_pipeline(
             tmp_path, orig_filename, model_name, language, "verbose_json",
-            temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb
+            temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb,
+            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token
         )
         if isinstance(res, dict):
             # Format VTT
             vtt_lines = ["WEBVTT\n"]
             for s in res.get("segments", []):
                 vtt_lines.append(f"{format_timestamp(s['start'], vtt=True)} --> {format_timestamp(s['end'], vtt=True)}")
-                vtt_lines.append(f"{s['text']}\n")
+                spk = s.get("speaker")
+                txt = s.get("text", "")
+                if spk:
+                    vtt_lines.append(f"<v {spk}>{txt}\n")
+                else:
+                    vtt_lines.append(f"{txt}\n")
             vtt_out = "\n".join(vtt_lines)
 
             # Format SRT
@@ -1291,7 +1449,12 @@ def async_webhook_worker(
             for i, s in enumerate(res.get("segments", []), 1):
                 srt_lines.append(str(i))
                 srt_lines.append(f"{format_timestamp(s['start'], vtt=False)} --> {format_timestamp(s['end'], vtt=False)}")
-                srt_lines.append(f"{s['text']}\n")
+                spk = s.get("speaker")
+                txt = s.get("text", "")
+                if spk:
+                    srt_lines.append(f"[{spk}]: {txt}\n")
+                else:
+                    srt_lines.append(f"{txt}\n")
             srt_out = "\n".join(srt_lines)
 
             payload = {
@@ -1343,7 +1506,11 @@ def transcribe(
     temperature: Optional[float] = Form(0.0),
     prompt: Optional[str] = Form(None),
     isolate_vocals: Optional[bool] = Form(False),
-    time_offset: Optional[float] = Form(-0.55),
+    time_offset: Optional[float] = Form(0.0),
+    diarize: Optional[bool] = Form(False),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+    hf_token: Optional[str] = Form(None),
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
     custom_id: Optional[str] = Form(None),
@@ -1361,19 +1528,20 @@ def transcribe(
         tmp_path = tmp.name
 
     file_size_mb = round(len(content) / (1024 * 1024), 2)
-    offset_val = -0.55 if time_offset is None else float(time_offset)
+    offset_val = 0.0 if time_offset is None else float(time_offset)
 
     # If webhook_url is supplied, execute asynchronously
     if webhook_url:
         with state_lock:
             active_jobs += 1
             last_active_time = start_ts
-        log_transcribe(f"[WEBHOOK SUBMITTED] ไฟล์: {orig_filename} ({file_size_mb} MB) -> Webhook: {webhook_url} (custom_id: {custom_id})")
+        log_transcribe(f"[WEBHOOK SUBMITTED] ไฟล์: {orig_filename} ({file_size_mb} MB) -> Webhook: {webhook_url} (custom_id: {custom_id})" + (" [Diarize=True]" if diarize else ""))
         background_tasks.add_task(
             async_webhook_worker,
             tmp_path, orig_filename, model_name, language, response_format,
             temperature, prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
-            webhook_url, webhook_secret, custom_id
+            webhook_url, webhook_secret, custom_id,
+            diarize, min_speakers, max_speakers, hf_token
         )
         return {
             "status": "queued",
@@ -1391,7 +1559,8 @@ def transcribe(
     try:
         return do_transcription_pipeline(
             tmp_path, orig_filename, model_name, language, response_format,
-            temperature, prompt, isolate_vocals, offset_val, start_ts, file_size_mb
+            temperature, prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
+            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token
         )
     except Exception as e:
         infer_sec = round(time.time() - start_ts, 2)

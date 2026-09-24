@@ -5,7 +5,17 @@ import os
 import urllib.request
 import urllib.parse
 
-VAST_API_KEY = os.environ.get("VAST_API_KEY", "bb158182f28dba3c4d30c71fd31eca1149c65b308b7f59ead54c0a5c66332a5d")
+VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
+if not VAST_API_KEY:
+    for kp in ["/root/.vast_api_key", "/root/.config/vastai/vast_api_key"]:
+        if os.path.exists(kp):
+            try:
+                content = open(kp).read().strip()
+                if content:
+                    VAST_API_KEY = content
+                    break
+            except Exception:
+                pass
 STORAGE_REGISTER_URL = os.environ.get("STORAGE_REGISTER_URL", "http://ph.cdnwatch.com/subtitle.php?action=register_node")
 LOG_FILE = "/root/whisper-server/self_register.log"
 
@@ -30,8 +40,8 @@ if os.path.exists(label_file):
         log(f"Error reading container label: {e}")
 
 if not inst_id:
-    # Fallback to hostname or env
-    inst_id = os.environ.get("VAST_CONTAINERLABEL", "").replace("C.", "") or os.uname().nodename
+    # Fallback to CONTAINER_ID, VAST_CONTAINERLABEL or hostname
+    inst_id = os.environ.get("CONTAINER_ID") or os.environ.get("VAST_CONTAINERLABEL", "").replace("C.", "") or os.uname().nodename
 
 log(f"Detected Instance ID: {inst_id}")
 

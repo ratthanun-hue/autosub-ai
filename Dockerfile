@@ -25,7 +25,8 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    soundfile
+    soundfile \
+    pyannote.audio==3.3.2
 
 # อบโมเดล AI ทั้ง 4 ตัวไว้ใน Image ล่วงหน้า (บูตเครื่องแล้วทำงานได้ทันทีภายใน 15 วิ)
 RUN python -c "\
