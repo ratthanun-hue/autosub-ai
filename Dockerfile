@@ -25,24 +25,10 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    soundfile \
-    pyannote.audio==3.3.2
+    soundfile
 
-# อบโมเดล AI ทั้ง 4 ตัวไว้ใน Image ล่วงหน้า (บูตเครื่องแล้วทำงานได้ทันทีภายใน 15 วิ)
-RUN python -c "\
-from faster_whisper import WhisperModel; \
-print('Pre-baking large-v3-turbo...'); \
-WhisperModel('large-v3-turbo', device='cpu', compute_type='int8'); \
-from huggingface_hub import snapshot_download; \
-print('Pre-baking Typhoon CTC...'); \
-snapshot_download('typhoon-ai/typhoon-whisper-large-v3-ctc'); \
-print('Pre-baking Typhoon Base...'); \
-snapshot_download('typhoon-ai/typhoon-whisper-large-v3'); \
-import torchaudio; \
-print('Pre-baking HDemucs model...'); \
-torchaudio.pipelines.HDEMUCS_HIGH_MUSDB.get_model(); \
-print('All models baked successfully!'); \
-"
+# โมเดล AI ทั้ง 4 ตัว (ขนาดรวม 7.7 GB) ถูกแยกไปเก็บบน Cloudflare R2 เพื่อให้ Docker Image เบา (~3 GB) 
+# และบูตผ่าน aria2c มัลติสตรีม 16 ท่อใน entrypoint.sh เสร็จใน 20-30 วิ โดยไม่เปลืองพื้นที่ดิสก์ตอน Build
 
 # คัดลอกโค้ดสคริปต์, พจนานุกรม และสคริปต์ลงทะเบียนอัตโนมัติ
 WORKDIR /root/whisper-server

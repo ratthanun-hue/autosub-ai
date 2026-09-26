@@ -592,26 +592,44 @@ def correct_thai_transcription(text: str) -> str:
                 correct_thai_transcription._last_mtime = mtime
     except Exception:
         pass
+    # 1. Regex dictionary corrections
     for pattern, repl in THAI_CORRECTIONS.items():
         text = re.sub(pattern, repl, text)
-    return text
+
+    # 2. Deduplicate word repeated 3+ times with spaces (e.g. "ทำไม ทำไม ทำไม ทำไม" -> "ทำไม ทำไม")
+    text = re.sub(r'(\S+)(?:\s+){2,}', r' ', text)
+
+    # 3. Deduplicate Thai words repeated 3+ times without spaces (e.g. "ทำไมทำไมทำไมทำไม" -> "ทำไมทำไม")
+    text = re.sub(r'([฀-๿]{2,15}?){2,}', r'', text)
+
+    # 4. Clean commas in Thai text (replace comma with space or remove if already spaced)
+    text = re.sub(r'[\s,]*,\s*', ' ', text)
+
+    # 5. Remove leading/trailing unwanted punctuation and symbols
+    text = re.sub(r'^[,\.\s\?!:;]+', '', text)
+    text = re.sub(r'[,\.\s]+$', '', text)
+
+    # 6. Collapse multiple spaces
+    text = re.sub(r' {2,}', ' ', text)
+    return text.strip()
 
 DEFAULT_DRAMA_PROMPT = (
     "รายการต่อไปนี้เป็นรายการทั่วไป สามารถรับชมได้ทุกวัย เหมาะสำหรับผู้ชมที่มีอายุ 13 ปีขึ้นไป "
-    "อาจมีภาพ เสียง หรือเนื้อหาที่ต้องใช้วิจารณญาณในการรับชม บทสนทนาละครและซีรีส์ไทย "
-    "ภาษาพูดสแลง: ตัวแม่, ตัวมัม, จึ้ง, ฉ่ำ, นอยด์, บูด, โป๊ะ, บ้ง, ช็อตฟีล, แกง, มโน, สภาพ, "
-    "เต็มคาราเบล, ปังมาก, ปังปุริเย่, ดีย์, ตัวตึง, แซ่บนัว, สายมู, ป้ายยา, ทรงอย่างแบด, แฉยับ, "
-    "หัวร้อน, ประสาทแดก, กวนตีน, ห้องน้ำ, โถฉี่, มีอารมณ์, โกรธ, ทำไมวะ, อะไรวะ, กู, มึง, ไอ้, ใคร, ไปไหน, "
-    "ไม่เป็นไร, เข้าใจ, ปัญหา, รักษา, ป่วย, หมอ, โรงพยาบาล, นะคะ, ครับ, จ้ะ, วะ, เว้ย"
+    "อาจมีภาพ เสียง หรือเนื้อหาที่ต้องใช้วิจารณญาณในการรับชม ผู้ชมที่มีอายุน้อยกว่า 13 ปี ควรได้รับคำแนะนำ "
+    "ผู้ปกครองควรให้คำแนะนำ บทสนทนาละครและซีรีส์ไทย "
+    "ภาษาพูดสแลง: ตัวแม่ ตัวมัม จึ้ง ฉ่ำ โฮ่ง นอยด์ บูด โป๊ะ บ้ง ช็อตฟีล แกง มโน สภาพ "
+    "เต็มคาราเบล ปังมาก ปังปุริเย่ ดีย์ ตัวตึง แซ่บนัว สายมู ป้ายยา ทรงอย่างแบด แฉยับ "
+    "หัวร้อน ประสาทแดก กวนตีน ห้องน้ำ โถฉี่ มีอารมณ์ โกรธ ทำไมวะ อะไรวะ กู มึง ไอ้ ใคร ไปไหน "
+    "ไม่เป็นไร เข้าใจ ปัญหา รักษา ป่วย หมอ โรงพยาบาล นะคะ ครับ จ้ะ เว้ย"
 )
 
 
-def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = 0.0, max_cue_dur: float = 5.0):
+def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = -0.15, max_cue_dur: float = 5.0):
     segments = []
     curr = []
     seg_id = 0
 
-    # Apply time_offset (default 0.0s for sample-accurate WAV/audio alignment)
+    # Apply time_offset (tuned to -0.15s: shifts subtitles 0.15s earlier for exact lip sync)
     shifted_words = []
     for w in all_words:
         s = max(0.0, round(w["start"] + time_offset, 3))
@@ -680,7 +698,7 @@ def format_timestamp(seconds: float, vtt: bool = False) -> str:
     sep = "." if vtt else ","
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{msecs:03d}"
 
-def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = False, time_offset: float = 0.0):
+def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = False, time_offset: float = -0.15):
     """
     End-to-End Thai Transcription & Alignment via Typhoon CTC:
     1. Vocal Isolation (HDemucs) -> optional BGM removal
@@ -817,7 +835,7 @@ def transcribe_with_turbo_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = 0.0,
+    time_offset: float = -0.15,
 ):
     """
     End-to-End Thai Transcription & Alignment via Whisper large-v3-turbo:
@@ -845,8 +863,10 @@ def transcribe_with_turbo_thai(
 
     if not initial_prompt or not initial_prompt.strip():
         initial_prompt = DEFAULT_DRAMA_PROMPT
-    else:
+    elif "รายการต่อไปนี้" not in initial_prompt:
         initial_prompt = initial_prompt.strip() + " " + DEFAULT_DRAMA_PROMPT
+    else:
+        initial_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
 
     segments_gen, info = turbo_model.transcribe(
         wav,
@@ -855,8 +875,8 @@ def transcribe_with_turbo_thai(
         beam_size=5,
         word_timestamps=True,
         initial_prompt=initial_prompt,
-        condition_on_previous_text=True,
-        repetition_penalty=1.15,
+        condition_on_previous_text=False,
+        repetition_penalty=1.04,
         no_speech_threshold=0.6,
         compression_ratio_threshold=2.4,
         vad_filter=True,
@@ -933,7 +953,7 @@ def transcribe_hybrid_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = 0.0,
+    time_offset: float = -0.15,
 ):
     """
     Hybrid Pipeline: Turbo for transcription + Typhoon CTC for 20ms alignment.
@@ -961,8 +981,10 @@ def transcribe_hybrid_thai(
 
     if not initial_prompt or not initial_prompt.strip():
         initial_prompt = DEFAULT_DRAMA_PROMPT
-    else:
+    elif "รายการต่อไปนี้" not in initial_prompt:
         initial_prompt = initial_prompt.strip() + " " + DEFAULT_DRAMA_PROMPT
+    else:
+        initial_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
 
     # ===== STEP 1: Turbo transcription (full coverage) =====
     segments_gen, info = turbo_model.transcribe(
@@ -972,8 +994,8 @@ def transcribe_hybrid_thai(
         beam_size=5,
         word_timestamps=True,
         initial_prompt=initial_prompt,
-        condition_on_previous_text=True,
-        repetition_penalty=1.15,
+        condition_on_previous_text=False,
+        repetition_penalty=1.04,
         no_speech_threshold=0.6,
         compression_ratio_threshold=2.4,
         vad_filter=True,
@@ -1011,7 +1033,7 @@ def transcribe_hybrid_thai(
                 target_ids = []
                 chars = []
                 for ch in seg_text:
-                    if ch in ctc_sym2id and not ch.isspace():
+                    if ch in ctc_sym2id and not ch.isspace() and ch != ',':
                         target_ids.append(ctc_sym2id[ch])
                         chars.append(ch)
 
@@ -1094,7 +1116,7 @@ def transcribe_hybrid_thai(
             char_spans = []
             if seg.words:
                 for w in seg.words:
-                    clean = w.word.strip()
+                    clean = w.word.strip().replace(",", "")
                     if not clean:
                         continue
                     dur = max(0.01, w.end - w.start)
@@ -1299,7 +1321,7 @@ def do_transcription_pipeline(
 ):
     lang_code = (language or "th").strip().lower()
     req_model = (model_name or "auto").strip().lower()
-    offset_val = 0.0 if time_offset is None else float(time_offset)
+    offset_val = -0.15 if time_offset is None else float(time_offset)
 
     if req_model in ["typhoon", "typhoon-ctc"]:
         engine_label = "Typhoon-Whisper-CTC" + (" + HDemucs" if isolate_vocals else "")
@@ -1519,8 +1541,9 @@ def transcribe(
     response_format: Optional[str] = Form("verbose_json"),
     temperature: Optional[float] = Form(0.0),
     prompt: Optional[str] = Form(None),
+    drama_title: Optional[str] = Form(None),
     isolate_vocals: Optional[bool] = Form(False),
-    time_offset: Optional[float] = Form(0.0),
+    time_offset: Optional[float] = Form(-0.15),
     diarize: Optional[bool] = Form(False),
     min_speakers: Optional[int] = Form(None),
     max_speakers: Optional[int] = Form(None),
@@ -1534,6 +1557,21 @@ def transcribe(
     start_ts = time.time()
     orig_filename = os.path.basename(file.filename or "audio.mp3")
 
+    # Centralized Prompt Builder on GPU: combine drama_title + prompt if supplied
+    title_clean = ""
+    if drama_title and drama_title.strip():
+        title_clean = re.sub(r'(ตอนที่|\s*ep\.?\s*\d+|disc\s*\d+)', '', drama_title.strip(), flags=re.IGNORECASE).strip()
+
+    prompt_parts = []
+    if title_clean:
+        prompt_parts.append(f"บทสนทนาละครเรื่อง {title_clean}")
+    if prompt and prompt.strip():
+        p_str = prompt.strip()
+        if p_str not in prompt_parts:
+            prompt_parts.append(p_str)
+
+    full_prompt = " ".join(prompt_parts) if prompt_parts else None
+
     # Read uploaded file content to temporary file
     suffix = os.path.splitext(orig_filename)[1] or ".mp3"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -1542,7 +1580,7 @@ def transcribe(
         tmp_path = tmp.name
 
     file_size_mb = round(len(content) / (1024 * 1024), 2)
-    offset_val = 0.0 if time_offset is None else float(time_offset)
+    offset_val = -0.15 if time_offset is None else float(time_offset)
 
     # If webhook_url is supplied, execute asynchronously
     if webhook_url:
@@ -1553,7 +1591,7 @@ def transcribe(
         background_tasks.add_task(
             async_webhook_worker,
             tmp_path, orig_filename, model_name, language, response_format,
-            temperature, prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
+            temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             webhook_url, webhook_secret, custom_id,
             diarize, min_speakers, max_speakers, hf_token
         )
@@ -1573,7 +1611,7 @@ def transcribe(
     try:
         return do_transcription_pipeline(
             tmp_path, orig_filename, model_name, language, response_format,
-            temperature, prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
+            temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token
         )
     except Exception as e:
