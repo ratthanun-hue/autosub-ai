@@ -737,13 +737,15 @@ def refine_subtitles_with_llm(
     known_chars: Optional[List[str]] = None,
     ollama_url: str = "http://127.0.0.1:11434",
     model: str = "qwen2.5:7b",
-    batch_size: int = 35
+    batch_size: int = 25
 ) -> list:
     """
-    Step 6: LLM Contextual Refinement (Qwen2.5-7B-Instruct)
-    - Sent in batches of 30-35 cues to guarantee JSON stability and rapid processing (~3.5s per batch).
-    - Strictly preserves timestamps (start/end) 100% untouched.
-    - Automatically falls back to Step 1 (Regex/Dict) if Ollama is unreachable or on timeout.
+    Step 6: LLM Contextual Refinement (Qwen2.5-7B-Instruct via Ollama)
+    - Batches of 20-25 cues sent as compact JSON key-value pairs {"0": "...", "1": "..."}.
+    - Grammar-constrained JSON mode ("format": "json") prevents extra commentary and ensures rapid generation (~8-12s per batch).
+    - Preserves exact timestamps (start/end) 100% untouched.
+    - Explicitly resolves ASR homophones and restores character names based on drama knowledge.
+    - Automatically and safely keeps original cues if Ollama is unreachable or on parsing error.
     """
     if not segments:
         return segments
@@ -754,14 +756,19 @@ def refine_subtitles_with_llm(
 
     log_transcribe(f"[LLM REFINEMENT] Starting Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
 
-    char_hint = f"\nตัวละครที่เกี่ยวข้อง: {', '.join(known_chars[:12])}" if known_chars else ""
+    char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
     system_prompt = (
-        f"คุณคือผู้เชี่ยวชาญด้านภาษาไทยและตรวจแก้บทซับไตเติลละครเรื่อง '{drama_title or 'ทั่วไป'}'{char_hint}\n"
-        "หน้าที่ของคุณคือ:\n"
-        "1. แก้คำสะกดผิด คำพ้องเสียง และชื่อตัวละครให้ถูกต้องตามบริบทและเนื้อเรื่อง\n"
-        "2. รักษาคำพูด เจตนา และคำสแลงเดิมของตัวละครไว้ ห้ามตัดทอนหรือแปลงความหมาย\n"
-        "3. ข้อห้ามเด็ดขาด: ห้ามลบ ห้ามรวม หรือเปลี่ยนหมายเลข id ใดๆ ทั้งสิ้น\n"
-        "4. ตอบกลับเฉพาะ JSON Array รูปแบบ [{\"id\": 1, \"text\": \"ข้อความที่เกลาแล้ว\"}, ...] เท่านั้น ห้ามใส่คำอธิบายอื่น"
+        f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
+        f"ภารกิจ: เกลาบริบทบทสนทนาและแก้ไขคำที่ระบบฟังเสียงพูด (ASR/Whisper) ฟังเพี้ยนหรือพ้องเสียง (Contextual Homophones)\n"
+        f"ข้อมูลละคร: เรื่อง '{drama_title or 'ทั่วไป'}'\n"
+        f"รายชื่อตัวละครหลัก: {char_str}\n\n"
+        "กฎเหล็กในการตรวจแก้:\n"
+        "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก เช่น หากได้ยินชื่อเพี้ยนหรือพ้องเสียงใกล้เคียง (เช่น พี่ดนทร์/พี่ผู้ชม/พี่โดน -> พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี -> เนตรศิริ) ให้แก้เป็นชื่อตัวละครที่ถูกต้องตามบริบท\n"
+        "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น:\n"
+        "   - เสียงพยัญชนะ/สระเพี้ยน: 'เต้นความ' -> 'แจ้งความ', 'จุดรวช' -> 'ตำรวจ', 'พลิกแฟร์ม' -> 'พลิกแฟ้ม'\n"
+        "   - คำไม่มีความหมายหรือผิดไวยากรณ์: 'โมโมง/มองหมอก' -> 'หมองมัว', 'สาปศูนย์' -> 'สาบสูญ'\n"
+        "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
+        "4. ส่งผลลัพธ์กลับมาเป็น JSON Object ตาม ID เดิมเป๊ะ ในรูปแบบ {{\"ID\": \"ข้อความ\"}}"
     )
 
     refined_segments = [dict(s) for s in segments]
@@ -769,20 +776,21 @@ def refine_subtitles_with_llm(
 
     for i in range(0, len(refined_segments), batch_size):
         chunk = refined_segments[i:i + batch_size]
-        payload = [{"id": s["id"], "text": s["text"]} for s in chunk]
+        cues_dict = {str(s["id"]): s["text"] for s in chunk}
 
         try:
             req_body = json.dumps({
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
-                ],
+                "format": "json",
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
                     "num_predict": 2048
-                }
+                },
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้:\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
+                ]
             }, ensure_ascii=False).encode("utf-8")
 
             req = urllib.request.Request(
@@ -791,21 +799,28 @@ def refine_subtitles_with_llm(
                 headers={"Content-Type": "application/json; charset=utf-8"}
             )
 
-            with urllib.request.urlopen(req, timeout=40.0) as resp:
+            with urllib.request.urlopen(req, timeout=45.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 content = data.get("message", {}).get("content", "").strip()
 
-                m = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
-                if m:
-                    corrections = json.loads(m.group(0))
-                    corr_map = {item["id"]: item["text"].strip() for item in corrections if "id" in item and "text" in item}
+                corr_map = {}
+                try:
+                    corr_map = json.loads(content)
+                except Exception:
+                    m = re.search(r'\{.*\}', content, re.DOTALL)
+                    if m:
+                        corr_map = json.loads(m.group(0))
+
+                if isinstance(corr_map, dict):
                     for s in chunk:
-                        sid = s["id"]
-                        if sid in corr_map and corr_map[sid] and corr_map[sid] != s["text"]:
-                            s["text"] = corr_map[sid]
-                            total_corrected += 1
+                        sid = str(s["id"])
+                        if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
+                            new_text = corr_map[sid].strip()
+                            if new_text != s["text"]:
+                                s["text"] = new_text
+                                total_corrected += 1
                 else:
-                    log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1}: JSON pattern not matched, keeping original cues.")
+                    log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1}: JSON is not a dict, keeping original cues.")
         except Exception as ex:
             log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
             continue
@@ -1662,6 +1677,8 @@ def do_transcription_pipeline(
     # Step 6: Contextual Refinement via Fast Local LLM (Qwen2.5-7B)
     if refine_llm and segments and lang_code in ["th", "thai", "t1"]:
         try:
+            if not known_chars and drama_title:
+                known_chars = get_known_characters(drama_title)
             segments = refine_subtitles_with_llm(
                 segments,
                 drama_title=drama_title,
