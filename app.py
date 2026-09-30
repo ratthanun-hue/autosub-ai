@@ -729,12 +729,12 @@ DEFAULT_DRAMA_PROMPT = (
 )
 
 
-def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = -0.15, max_cue_dur: float = 5.0):
+def form_dialogue_segments(all_words, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.8, time_offset: float = 0.0, max_cue_dur: float = 5.0):
     segments = []
     curr = []
     seg_id = 0
 
-    # Apply time_offset (tuned to -0.15s: shifts subtitles 0.15s earlier for exact lip sync)
+    # Apply time_offset (default 0.0s: exact match to audio waveform / CTC speech boundaries)
     shifted_words = []
     for w in all_words:
         s = max(0.0, round(w["start"] + time_offset, 3))
@@ -803,7 +803,7 @@ def format_timestamp(seconds: float, vtt: bool = False) -> str:
     sep = "." if vtt else ","
     return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{msecs:03d}"
 
-def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = False, time_offset: float = -0.15):
+def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pause_sec: float = 0.22, min_cue_dur: float = 0.9, isolate_vocals: bool = True, time_offset: float = 0.0):
     """
     End-to-End Thai Transcription & Alignment via Typhoon CTC:
     1. Vocal Isolation (HDemucs) -> optional BGM removal
@@ -940,8 +940,8 @@ def transcribe_with_turbo_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = -0.15,
-    isolate_vocals: bool = False,
+    time_offset: float = 0.0,
+    isolate_vocals: bool = True,
 ):
     """
     End-to-End Thai Transcription & Alignment via Whisper large-v3-turbo:
@@ -1078,8 +1078,8 @@ def transcribe_hybrid_thai(
     max_pause_sec: float = 0.22,
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
-    time_offset: float = -0.15,
-    isolate_vocals: bool = False,
+    time_offset: float = 0.0,
+    isolate_vocals: bool = True,
 ):
     """
     Hybrid Pipeline: Turbo for transcription + Typhoon CTC for 20ms alignment.
@@ -1467,7 +1467,7 @@ def do_transcription_pipeline(
 ):
     lang_code = (language or "th").strip().lower()
     req_model = (model_name or "auto").strip().lower()
-    offset_val = -0.15 if time_offset is None else float(time_offset)
+    offset_val = 0.0 if time_offset is None else float(time_offset)
 
     if req_model in ["typhoon", "typhoon-ctc"]:
         engine_label = "Typhoon-Whisper-CTC" + (" + HDemucs" if isolate_vocals else "")
@@ -1731,8 +1731,8 @@ def transcribe(
     prompt: Optional[str] = Form(None),
     drama_title: Optional[str] = Form(None),
     characters: Optional[str] = Form(None),
-    isolate_vocals: Optional[bool] = Form(False),
-    time_offset: Optional[float] = Form(-0.15),
+    isolate_vocals: Optional[bool] = Form(True),
+    time_offset: Optional[float] = Form(0.0),
     diarize: Optional[bool] = Form(False),
     min_speakers: Optional[int] = Form(None),
     max_speakers: Optional[int] = Form(None),
@@ -1803,7 +1803,7 @@ def transcribe(
         tmp_path = tmp.name
 
     file_size_mb = round(len(content) / (1024 * 1024), 2)
-    offset_val = -0.15 if time_offset is None else float(time_offset)
+    offset_val = 0.0 if time_offset is None else float(time_offset)
 
     # If webhook_url is supplied, execute asynchronously
     if webhook_url:

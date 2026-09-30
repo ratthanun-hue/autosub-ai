@@ -35,6 +35,7 @@ WORKDIR /root/whisper-server
 COPY app.py .
 COPY thai_corrections.json .
 COPY thai_slang_words.json .
+COPY drama_character_knowledge.json .
 COPY self_register.py .
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
