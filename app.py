@@ -751,10 +751,11 @@ def refine_subtitles_with_llm(
         return segments
 
     if not check_ollama_available(ollama_url):
-        log_transcribe(f"[LLM REFINEMENT] Ollama service not reachable at {ollama_url}. Safely keeping Step 1 cues.")
+        log_transcribe(f"[STEP 6 LLM NOTICE] Ollama service not reachable at {ollama_url}. Safely keeping Step 5 cues.")
         return segments
 
-    log_transcribe(f"[LLM REFINEMENT] Starting Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
+    t_llm_start = time.time()
+    log_transcribe(f"[STEP 6 LLM] Starting Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
 
     char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
     system_prompt = (
@@ -820,12 +821,13 @@ def refine_subtitles_with_llm(
                                 s["text"] = new_text
                                 total_corrected += 1
                 else:
-                    log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1}: JSON is not a dict, keeping original cues.")
+                    log_transcribe(f"[STEP 6 LLM WARN] Batch {i//batch_size + 1}: JSON is not a dict, keeping original cues.")
         except Exception as ex:
-            log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
+            log_transcribe(f"[STEP 6 LLM WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
             continue
 
-    log_transcribe(f"[LLM REFINEMENT COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully (Timestamps 100% preserved).")
+    llm_dur = round(time.time() - t_llm_start, 2)
+    log_transcribe(f"[STEP 6 LLM COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully in {llm_dur}s (Timestamps 100% preserved).")
     return refined_segments
 
 DEFAULT_DRAMA_PROMPT = (
@@ -1190,13 +1192,15 @@ def transcribe_hybrid_thai(
     isolate_vocals: bool = True,
 ):
     """
-    Hybrid Pipeline: Turbo for transcription + Typhoon CTC for 20ms alignment.
+    Hybrid SOTA Pipeline:
     Step 0: Vocal Isolation (HDemucs) -> optional BGM removal
-    Step 1: Whisper large-v3-turbo -> full text (100% coverage, no dropped words)
+    Step 1: Whisper large-v3 -> full text (100% coverage, no dropped words)
     Step 2: Typhoon CTC Forced Alignment -> 20ms character-level timestamps
-    Step 3: PyThaiNLP word grouping -> natural Thai word boundaries
-    Step 4: Dialogue segmentation with ENDING_PARTICLES
-    Fallback: If CTC alignment fails for a segment, use Turbo word timestamps instead
+    Step 3: PyThaiNLP word grouping + Drama Knowledge Base Trie
+    Step 4: Dialogue segmentation with ENDING_PARTICLES & natural pauses
+    Step 5: Thai Regex & Phonetic Dictionary (1,077 rules)
+    Step 6: Fast Local LLM Contextual Refinement (Qwen2.5-7B via Ollama)
+    Fallback: If CTC alignment fails for a segment, use large-v3 word timestamps instead
     """
     wav, sr = sf.read(audio_path, dtype="float32")
     if isolate_vocals and demucs_model is not None:
@@ -1674,6 +1678,17 @@ def do_transcription_pipeline(
         except Exception as _d_err:
             log_transcribe(f"[DIARIZATION NOTICE] Skipped due to error: {_d_err}")
 
+    # Step 5: Thai Regex & Phonetic Dictionary Corrections
+    if lang_code in ["th", "thai", "t1"] and segments:
+        step5_corrections = 0
+        for s in segments:
+            orig_t = s["text"]
+            cleaned_t = correct_thai_transcription(orig_t)
+            if cleaned_t != orig_t:
+                s["text"] = cleaned_t
+                step5_corrections += 1
+        log_transcribe(f"[STEP 5 DICTIONARY] Applied 1,077 Thai rules across {len(segments)} cues ({step5_corrections} cues modified)")
+
     # Step 6: Contextual Refinement via Fast Local LLM (Qwen2.5-7B)
     if refine_llm and segments and lang_code in ["th", "thai", "t1"]:
         try:
@@ -1686,7 +1701,7 @@ def do_transcription_pipeline(
             )
             combined_text = " ".join(s["text"] for s in segments)
         except Exception as _llm_err:
-            log_transcribe(f"[LLM REFINEMENT WARN] Refinement failed: {_llm_err}. Keeping original cues.")
+            log_transcribe(f"[STEP 6 LLM WARN] Refinement failed: {_llm_err}. Keeping original cues.")
 
     infer_sec = round(time.time() - start_ts, 2)
     speedup = round(audio_dur / infer_sec, 1) if infer_sec > 0 else 0
