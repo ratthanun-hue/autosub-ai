@@ -1463,7 +1463,8 @@ def do_transcription_pipeline(
     diarize: Optional[bool] = False,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
-    hf_token: Optional[str] = None
+    hf_token: Optional[str] = None,
+    drama_title: Optional[str] = None
 ):
     lang_code = (language or "th").strip().lower()
     req_model = (model_name or "auto").strip().lower()
@@ -1485,6 +1486,13 @@ def do_transcription_pipeline(
             time_offset=offset_val,
             isolate_vocals=bool(isolate_vocals)
         )
+        if drama_title and str(drama_title).strip():
+            d_clean = str(drama_title).strip()
+            if d_clean == "วังวารี":
+                for s in segments:
+                    s["text"] = re.sub(r'(?:พวข)?ว[าั][งง][วห]*[าา][ลร]ี', 'วังวารี', s["text"])
+                    s["text"] = re.sub(r'เหมือนกัน่ะ', 'เหมือนกันน่ะ', s["text"])
+            combined_text = " ".join(s["text"] for s in segments)
         detected_lang = "th"
     elif lang_code in ["th", "thai", "t1"]:
         engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
@@ -1620,7 +1628,8 @@ def async_webhook_worker(
     diarize: Optional[bool] = False,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
-    hf_token: Optional[str] = None
+    hf_token: Optional[str] = None,
+    drama_title: Optional[str] = None
 ):
     global active_jobs, total_jobs_completed, last_active_time
     token = current_file_ctx.set(orig_filename)
@@ -1628,7 +1637,8 @@ def async_webhook_worker(
         res = do_transcription_pipeline(
             tmp_path, orig_filename, model_name, language, "verbose_json",
             temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb,
-            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token
+            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
+            drama_title=drama_title
         )
         if isinstance(res, dict):
             # Format VTT
@@ -1751,11 +1761,26 @@ def transcribe(
     if drama_title and drama_title.strip():
         title_clean = re.sub(r'(ตอนที่|\s*ep\.?\s*\d+|disc\s*\d+)', '', drama_title.strip(), flags=re.IGNORECASE).strip()
     if not title_clean and orig_filename:
-        m = re.match(r'^([a-zA-Z0-9_\u0E00-\u0E7F-]+?)(?:-|_|\.|$)', orig_filename)
-        if m:
-            extracted = re.sub(r'(disc\s*\d+|ep\.?\s*\d+|_\d+k)', '', m.group(1), flags=re.IGNORECASE).strip()
-            if len(extracted) >= 3:
-                title_clean = extracted
+        # Strip common test/clip prefixes
+        cleaned_orig = re.sub(r'^(test_|sample_|clip_|trailer_|preview_)', '', orig_filename, flags=re.IGNORECASE)
+        # Check known romanized mapping
+        roman_to_thai = {
+            "wangwari": "วังวารี",
+            "wang_wari": "วังวารี",
+            "wangwaree": "วังวารี",
+            "crowclub": "อีกาคลับ",
+            "plslove": "ได้โปรดรักฉัน"
+        }
+        for r_key, t_val in roman_to_thai.items():
+            if r_key in cleaned_orig.lower():
+                title_clean = t_val
+                break
+        if not title_clean:
+            m = re.match(r'^([a-zA-Z0-9_\u0E00-\u0E7F-]+?)(?:-|_|\.|$)', cleaned_orig)
+            if m:
+                extracted = re.sub(r'(disc\s*\d+|ep\.?\s*\d+|_\d+k)', '', m.group(1), flags=re.IGNORECASE).strip()
+                if len(extracted) >= 3:
+                    title_clean = extracted
 
     # 2. Auto-learn characters if supplied by user/admin
     if characters and characters.strip():
@@ -1816,7 +1841,8 @@ def transcribe(
             tmp_path, orig_filename, model_name, language, response_format,
             temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             webhook_url, webhook_secret, custom_id,
-            diarize, min_speakers, max_speakers, hf_token
+            diarize, min_speakers, max_speakers, hf_token,
+            title_clean
         )
         return {
             "status": "queued",
@@ -1835,7 +1861,8 @@ def transcribe(
         return do_transcription_pipeline(
             tmp_path, orig_filename, model_name, language, response_format,
             temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
-            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token
+            diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
+            drama_title=title_clean
         )
     except Exception as e:
         infer_sec = round(time.time() - start_ts, 2)
