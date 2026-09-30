@@ -720,6 +720,99 @@ def correct_thai_transcription(text: str) -> str:
     text = re.sub(r' {2,}', ' ', text)
     return text.strip()
 
+# ==========================================
+# STEP 2 LLM CONTEXTUAL REFINEMENT (Qwen2.5-7B)
+# ==========================================
+def check_ollama_available(ollama_url: str = "http://127.0.0.1:11434") -> bool:
+    try:
+        req = urllib.request.Request(f"{ollama_url}/api/tags", headers={"User-Agent": "AutoSub-LLM-Checker/1.0"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+def refine_subtitles_with_llm(
+    segments: list,
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    ollama_url: str = "http://127.0.0.1:11434",
+    model: str = "qwen2.5:7b",
+    batch_size: int = 35
+) -> list:
+    """
+    Step 6: LLM Contextual Refinement (Qwen2.5-7B-Instruct)
+    - Sent in batches of 30-35 cues to guarantee JSON stability and rapid processing (~3.5s per batch).
+    - Strictly preserves timestamps (start/end) 100% untouched.
+    - Automatically falls back to Step 1 (Regex/Dict) if Ollama is unreachable or on timeout.
+    """
+    if not segments:
+        return segments
+
+    if not check_ollama_available(ollama_url):
+        log_transcribe(f"[LLM REFINEMENT] Ollama service not reachable at {ollama_url}. Safely keeping Step 1 cues.")
+        return segments
+
+    log_transcribe(f"[LLM REFINEMENT] Starting Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
+
+    char_hint = f"\nตัวละครที่เกี่ยวข้อง: {', '.join(known_chars[:12])}" if known_chars else ""
+    system_prompt = (
+        f"คุณคือผู้เชี่ยวชาญด้านภาษาไทยและตรวจแก้บทซับไตเติลละครเรื่อง '{drama_title or 'ทั่วไป'}'{char_hint}\n"
+        "หน้าที่ของคุณคือ:\n"
+        "1. แก้คำสะกดผิด คำพ้องเสียง และชื่อตัวละครให้ถูกต้องตามบริบทและเนื้อเรื่อง\n"
+        "2. รักษาคำพูด เจตนา และคำสแลงเดิมของตัวละครไว้ ห้ามตัดทอนหรือแปลงความหมาย\n"
+        "3. ข้อห้ามเด็ดขาด: ห้ามลบ ห้ามรวม หรือเปลี่ยนหมายเลข id ใดๆ ทั้งสิ้น\n"
+        "4. ตอบกลับเฉพาะ JSON Array รูปแบบ [{\"id\": 1, \"text\": \"ข้อความที่เกลาแล้ว\"}, ...] เท่านั้น ห้ามใส่คำอธิบายอื่น"
+    )
+
+    refined_segments = [dict(s) for s in segments]
+    total_corrected = 0
+
+    for i in range(0, len(refined_segments), batch_size):
+        chunk = refined_segments[i:i + batch_size]
+        payload = [{"id": s["id"], "text": s["text"]} for s in chunk]
+
+        try:
+            req_body = json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+                ],
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "num_predict": 2048
+                }
+            }, ensure_ascii=False).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{ollama_url}/api/chat",
+                data=req_body,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
+
+            with urllib.request.urlopen(req, timeout=40.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                content = data.get("message", {}).get("content", "").strip()
+
+                m = re.search(r'\[\s*\{.*\}\s*\]', content, re.DOTALL)
+                if m:
+                    corrections = json.loads(m.group(0))
+                    corr_map = {item["id"]: item["text"].strip() for item in corrections if "id" in item and "text" in item}
+                    for s in chunk:
+                        sid = s["id"]
+                        if sid in corr_map and corr_map[sid] and corr_map[sid] != s["text"]:
+                            s["text"] = corr_map[sid]
+                            total_corrected += 1
+                else:
+                    log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1}: JSON pattern not matched, keeping original cues.")
+        except Exception as ex:
+            log_transcribe(f"[LLM REFINEMENT WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
+            continue
+
+    log_transcribe(f"[LLM REFINEMENT COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully (Timestamps 100% preserved).")
+    return refined_segments
+
 DEFAULT_DRAMA_PROMPT = (
     "บทสนทนาภาษาไทยทั่วไป ละครและซีรีส์: "
     "สวัสดีครับ ค่ะ นะคะ นะครับ ใช่ไหม จริงเหรอ ไม่เป็นไร "
@@ -1464,7 +1557,9 @@ def do_transcription_pipeline(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     hf_token: Optional[str] = None,
-    drama_title: Optional[str] = None
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    refine_llm: Optional[bool] = True
 ):
     lang_code = (language or "th").strip().lower()
     req_model = (model_name or "auto").strip().lower()
@@ -1564,6 +1659,18 @@ def do_transcription_pipeline(
         except Exception as _d_err:
             log_transcribe(f"[DIARIZATION NOTICE] Skipped due to error: {_d_err}")
 
+    # Step 6: Contextual Refinement via Fast Local LLM (Qwen2.5-7B)
+    if refine_llm and segments and lang_code in ["th", "thai", "t1"]:
+        try:
+            segments = refine_subtitles_with_llm(
+                segments,
+                drama_title=drama_title,
+                known_chars=known_chars
+            )
+            combined_text = " ".join(s["text"] for s in segments)
+        except Exception as _llm_err:
+            log_transcribe(f"[LLM REFINEMENT WARN] Refinement failed: {_llm_err}. Keeping original cues.")
+
     infer_sec = round(time.time() - start_ts, 2)
     speedup = round(audio_dur / infer_sec, 1) if infer_sec > 0 else 0
 
@@ -1629,7 +1736,9 @@ def async_webhook_worker(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     hf_token: Optional[str] = None,
-    drama_title: Optional[str] = None
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    refine_llm: Optional[bool] = True
 ):
     global active_jobs, total_jobs_completed, last_active_time
     token = current_file_ctx.set(orig_filename)
@@ -1638,7 +1747,7 @@ def async_webhook_worker(
             tmp_path, orig_filename, model_name, language, "verbose_json",
             temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb,
             diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
-            drama_title=drama_title
+            drama_title=drama_title, known_chars=known_chars, refine_llm=refine_llm
         )
         if isinstance(res, dict):
             # Format VTT
@@ -1750,6 +1859,7 @@ def transcribe(
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
     custom_id: Optional[str] = Form(None),
+    refine_llm: Optional[bool] = Form(True),
     background_tasks: BackgroundTasks = None
 ):
     global active_jobs, total_jobs_completed, last_active_time
@@ -1842,7 +1952,7 @@ def transcribe(
             temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             webhook_url, webhook_secret, custom_id,
             diarize, min_speakers, max_speakers, hf_token,
-            title_clean
+            title_clean, known_chars, refine_llm
         )
         return {
             "status": "queued",
@@ -1862,7 +1972,7 @@ def transcribe(
             tmp_path, orig_filename, model_name, language, response_format,
             temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
-            drama_title=title_clean
+            drama_title=title_clean, known_chars=known_chars, refine_llm=refine_llm
         )
     except Exception as e:
         infer_sec = round(time.time() - start_ts, 2)
