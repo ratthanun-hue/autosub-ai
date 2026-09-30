@@ -8,7 +8,8 @@ import threading
 import subprocess
 import tempfile
 import logging
-from typing import Optional
+from typing import Optional, List, Union, Dict
+from pydantic import BaseModel
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -329,11 +330,12 @@ watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
 watchdog_thread.start()
 
 # ==========================================
-# 1. ENGINE INITIALIZATION: MULTILINGUAL TURBO
+# 1. ENGINE INITIALIZATION: FULL LARGE-V3
 # ==========================================
-print("Initializing Multilingual Engine: Whisper large-v3-turbo (CUDA FP16)...")
-turbo_model = FasterWhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
-print("Multilingual Engine (Chinese/Korean/English/Japanese) Ready!")
+print("Initializing Full Transcription Engine: Whisper large-v3 (CUDA FP16)...")
+whisper_model = FasterWhisperModel("large-v3", device="cuda", compute_type="float16")
+turbo_model = whisper_model  # alias for backward compatibility across functions
+print("Full large-v3 Engine (32-Decoder Layers, SOTA Quality) Ready!")
 
 # ==========================================
 # 2. ENGINE INITIALIZATION: TYPHOON THAI CTC
@@ -491,11 +493,116 @@ if not SLANG_WORDS:
         "กู", "มึง", "ไอ้", "วะ", "เว้ย", "โถฉี่", "ห้องน้ำ", "คุณยาดา", "เพชรแท้", "เพชรประกาย", "โถเตอะ"
     ]
 
+# ==========================================
+# PERSISTENT DRAMA CHARACTER KNOWLEDGE BASE
+# ==========================================
+DRAMA_KNOWLEDGE_PATH = os.path.join(os.path.dirname(__file__), "drama_character_knowledge.json")
+DRAMA_KNOWLEDGE: Dict[str, dict] = {}
+DRAMA_VOCABULARY: set = set()
+
+if os.path.exists(DRAMA_KNOWLEDGE_PATH):
+    try:
+        with open(DRAMA_KNOWLEDGE_PATH, "r", encoding="utf-8") as _f:
+            _dk_data = json.load(_f)
+            DRAMA_KNOWLEDGE = _dk_data.get("dramas", {})
+            DRAMA_VOCABULARY = set(_dk_data.get("vocabulary", []))
+            print(f"Loaded Drama Knowledge: {len(DRAMA_KNOWLEDGE)} dramas, {len(DRAMA_VOCABULARY)} unique vocabulary words into PyThaiNLP!")
+    except Exception as _e:
+        logging.warning(f"Could not load drama knowledge: {_e}")
+
+GLOBAL_VOCAB_SET = set(thai_words()).union(set(SLANG_WORDS)).union(DRAMA_VOCABULARY)
 try:
-    CUSTOM_TRIE = Trie(set(thai_words()).union(set(SLANG_WORDS)))
+    CUSTOM_TRIE = Trie(GLOBAL_VOCAB_SET)
 except Exception as _e:
     logging.warning(f"Could not build Trie with thai_words: {_e}")
-    CUSTOM_TRIE = Trie(set(SLANG_WORDS))
+    CUSTOM_TRIE = Trie(set(SLANG_WORDS).union(DRAMA_VOCABULARY))
+
+def learn_drama_characters(drama_title: str, characters: Union[str, List[str]], actors: Optional[Union[str, List[str]]] = None) -> int:
+    """
+    Dynamically learns new drama characters and adds them to:
+    1. In-memory DRAMA_KNOWLEDGE[drama_title]
+    2. PyThaiNLP CUSTOM_TRIE (in real-time, zero downtime)
+    3. Persistent drama_character_knowledge.json on disk
+    """
+    global DRAMA_KNOWLEDGE, DRAMA_VOCABULARY, GLOBAL_VOCAB_SET, CUSTOM_TRIE
+    if not drama_title or not str(drama_title).strip():
+        return 0
+
+    clean_title = re.sub(r'(\(จบ\)|ตอนที่.*|ep\..*|disc.*)', '', str(drama_title).strip(), flags=re.IGNORECASE).strip()
+    if not clean_title:
+        return 0
+
+    if clean_title not in DRAMA_KNOWLEDGE:
+        DRAMA_KNOWLEDGE[clean_title] = {"characters": [], "actors": []}
+
+    new_words = []
+    # Parse characters
+    raw_chars = characters if isinstance(characters, list) else re.split(r'[,\|\n\/]+', str(characters))
+    for c in raw_chars:
+        clean = re.sub(r'\([ชญ0-9]+\)', '', str(c)).strip()
+        clean = re.sub(r'^(คุณ|นาย|นาง|น\.ส\.|ด\.ช\.|ด\.ญ\.)\s*', '', clean).strip()
+        if 2 <= len(clean) <= 35:
+            if clean not in DRAMA_KNOWLEDGE[clean_title]["characters"]:
+                DRAMA_KNOWLEDGE[clean_title]["characters"].append(clean)
+            if clean not in GLOBAL_VOCAB_SET:
+                new_words.append(clean)
+
+    # Parse actors if provided
+    if actors:
+        raw_actors = actors if isinstance(actors, list) else re.split(r'[,\|\n\/]+', str(actors))
+        for a in raw_actors:
+            clean = str(a).strip()
+            if 3 <= len(clean) <= 35:
+                if clean not in DRAMA_KNOWLEDGE[clean_title]["actors"]:
+                    DRAMA_KNOWLEDGE[clean_title]["actors"].append(clean)
+                if clean not in GLOBAL_VOCAB_SET:
+                    new_words.append(clean)
+
+    # Add drama title itself
+    if clean_title not in GLOBAL_VOCAB_SET:
+        new_words.append(clean_title)
+
+    if new_words:
+        GLOBAL_VOCAB_SET.update(new_words)
+        DRAMA_VOCABULARY.update(new_words)
+        CUSTOM_TRIE = Trie(GLOBAL_VOCAB_SET)
+        log_transcribe(f"[AUTO-LEARN] สะสมคำศัพท์ตัวละครใหม่ {len(new_words)} คำสำหรับเรื่อง '{clean_title}': {', '.join(new_words[:10])}")
+
+        try:
+            with open(DRAMA_KNOWLEDGE_PATH, "w", encoding="utf-8") as _f:
+                json.dump({
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_dramas": len(DRAMA_KNOWLEDGE),
+                    "total_vocabulary": len(DRAMA_VOCABULARY),
+                    "dramas": DRAMA_KNOWLEDGE,
+                    "vocabulary": sorted(list(DRAMA_VOCABULARY))
+                }, _f, ensure_ascii=False, indent=2)
+        except Exception as _e:
+            log_transcribe(f"[AUTO-LEARN WARN] ไม่สามารถบันทึก drama_character_knowledge.json: {_e}")
+
+    return len(new_words)
+
+def get_known_characters(drama_title: str) -> List[str]:
+    """Look up known characters/actors for a drama title from DRAMA_KNOWLEDGE"""
+    if not drama_title or not str(drama_title).strip():
+        return []
+    clean_t = re.sub(r'(\(จบ\)|ตอนที่.*|ep\..*|disc.*)', '', str(drama_title).strip(), flags=re.IGNORECASE).strip()
+    if not clean_t:
+        return []
+
+    # Exact match first
+    if clean_t in DRAMA_KNOWLEDGE:
+        info = DRAMA_KNOWLEDGE[clean_t]
+        return list(dict.fromkeys(info.get("characters", []) + info.get("actors", [])))
+
+    # Partial match
+    clean_lower = clean_t.lower()
+    for dk_title, info in DRAMA_KNOWLEDGE.items():
+        dk_lower = dk_title.lower()
+        if dk_lower == clean_lower or dk_lower in clean_lower or clean_lower in dk_lower:
+            return list(dict.fromkeys(info.get("characters", []) + info.get("actors", [])))
+
+    return []
 
 def thai_tokenize(text: str):
     if not text:
@@ -614,13 +721,11 @@ def correct_thai_transcription(text: str) -> str:
     return text.strip()
 
 DEFAULT_DRAMA_PROMPT = (
-    "รายการต่อไปนี้เป็นรายการทั่วไป สามารถรับชมได้ทุกวัย เหมาะสำหรับผู้ชมที่มีอายุ 13 ปีขึ้นไป "
-    "อาจมีภาพ เสียง หรือเนื้อหาที่ต้องใช้วิจารณญาณในการรับชม ผู้ชมที่มีอายุน้อยกว่า 13 ปี ควรได้รับคำแนะนำ "
-    "ผู้ปกครองควรให้คำแนะนำ บทสนทนาละครและซีรีส์ไทย "
-    "ภาษาพูดสแลง: ตัวแม่ ตัวมัม จึ้ง ฉ่ำ โฮ่ง นอยด์ บูด โป๊ะ บ้ง ช็อตฟีล แกง มโน สภาพ "
-    "เต็มคาราเบล ปังมาก ปังปุริเย่ ดีย์ ตัวตึง แซ่บนัว สายมู ป้ายยา ทรงอย่างแบด แฉยับ "
-    "หัวร้อน ประสาทแดก กวนตีน ห้องน้ำ โถฉี่ มีอารมณ์ โกรธ ทำไมวะ อะไรวะ กู มึง ไอ้ ใคร ไปไหน "
-    "ไม่เป็นไร เข้าใจ ปัญหา รักษา ป่วย หมอ โรงพยาบาล นะคะ ครับ จ้ะ เว้ย"
+    "บทสนทนาภาษาไทยทั่วไป ละครและซีรีส์: "
+    "สวัสดีครับ ค่ะ นะคะ นะครับ ใช่ไหม จริงเหรอ ไม่เป็นไร "
+    "ตัวแม่ จึ้ง ฉ่ำ โฮ่ง นอยด์ โป๊ะ บ้ง ช็อตฟีล แกง มโน "
+    "ปังมาก ตัวตึง แซ่บนัว แฉยับ หัวร้อน กวนตีน "
+    "ทำไมวะ อะไรวะ กู มึง ไอ้ ใคร ไปไหน รักษา ป่วย หมอ โรงพยาบาล จ้ะ เว้ย"
 )
 
 
@@ -836,21 +941,38 @@ def transcribe_with_turbo_thai(
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
     time_offset: float = -0.15,
+    isolate_vocals: bool = False,
 ):
     """
     End-to-End Thai Transcription & Alignment via Whisper large-v3-turbo:
-    1. Dynamic RMS Normalization -> safely boosts soft speech & whispers
-    2. Large-v3-turbo Transformer Decoder -> context-aware, zero dropped sentences
-    3. Word-level Timestamps -> accurate alignment
-    4. PyThaiNLP Tokenization -> natural Thai word boundaries
-    5. Dialogue Segmentation -> ENDING_PARTICLES split, pause >= 0.08s, max 70 chars
+    1. Vocal Isolation (HDemucs) -> optional BGM removal
+    2. Dynamic RMS Normalization -> safely boosts soft speech & whispers
+    3. Large-v3-turbo Transformer Decoder -> context-aware, zero dropped sentences
+    4. Word-level Timestamps -> accurate alignment
+    5. PyThaiNLP Tokenization -> natural Thai word boundaries
+    6. Dialogue Segmentation -> ENDING_PARTICLES split, pause >= 0.08s, max 70 chars
     """
     wav, sr = sf.read(audio_path, dtype="float32")
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    if sr != 16000:
-        t_wav = torch.as_tensor(wav, dtype=torch.float32)
-        wav = AF.resample(t_wav, sr, 16000).numpy()
+    if isolate_vocals and demucs_model is not None:
+        try:
+            log_transcribe(f"[VOCAL ISOLATION] Running HDemucs v4 vocal isolation...")
+            t_vocals = isolate_vocals_from_audio(wav, sr)
+            wav = t_vocals.cpu().numpy()
+            sr = 16000
+            log_transcribe(f"[VOCAL ISOLATION] Vocal isolation completed successfully.")
+        except Exception as e:
+            log_transcribe(f"[WARN] HDemucs vocal isolation failed: {e}, using original audio")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr != 16000:
+                t_wav = torch.as_tensor(wav, dtype=torch.float32)
+                wav = AF.resample(t_wav, sr, 16000).numpy()
+    else:
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != 16000:
+            t_wav = torch.as_tensor(wav, dtype=torch.float32)
+            wav = AF.resample(t_wav, sr, 16000).numpy()
 
     # Dynamic Loudness / RMS Normalization
     rms = float(np.sqrt(np.mean(wav ** 2)))
@@ -863,10 +985,13 @@ def transcribe_with_turbo_thai(
 
     if not initial_prompt or not initial_prompt.strip():
         initial_prompt = DEFAULT_DRAMA_PROMPT
-    elif "รายการต่อไปนี้" not in initial_prompt:
-        initial_prompt = initial_prompt.strip() + " " + DEFAULT_DRAMA_PROMPT
     else:
-        initial_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
+        clean_user_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
+        ending_hints = "นะคะ ครับ ค่ะ จ้ะ"
+        if not any(h in clean_user_prompt for h in ["นะคะ", "ครับ", "ค่ะ"]):
+            initial_prompt = f"{clean_user_prompt} {ending_hints}"
+        else:
+            initial_prompt = clean_user_prompt
 
     segments_gen, info = turbo_model.transcribe(
         wav,
@@ -876,9 +1001,9 @@ def transcribe_with_turbo_thai(
         word_timestamps=True,
         initial_prompt=initial_prompt,
         condition_on_previous_text=False,
-        repetition_penalty=1.04,
+        repetition_penalty=1.15,
         no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
+        compression_ratio_threshold=2.2,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
     )
@@ -954,9 +1079,11 @@ def transcribe_hybrid_thai(
     min_cue_dur: float = 0.8,
     temperature: float = 0.0,
     time_offset: float = -0.15,
+    isolate_vocals: bool = False,
 ):
     """
     Hybrid Pipeline: Turbo for transcription + Typhoon CTC for 20ms alignment.
+    Step 0: Vocal Isolation (HDemucs) -> optional BGM removal
     Step 1: Whisper large-v3-turbo -> full text (100% coverage, no dropped words)
     Step 2: Typhoon CTC Forced Alignment -> 20ms character-level timestamps
     Step 3: PyThaiNLP word grouping -> natural Thai word boundaries
@@ -964,11 +1091,26 @@ def transcribe_hybrid_thai(
     Fallback: If CTC alignment fails for a segment, use Turbo word timestamps instead
     """
     wav, sr = sf.read(audio_path, dtype="float32")
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    if sr != 16000:
-        t_wav = torch.as_tensor(wav, dtype=torch.float32)
-        wav = AF.resample(t_wav, sr, 16000).numpy()
+    if isolate_vocals and demucs_model is not None:
+        try:
+            log_transcribe(f"[VOCAL ISOLATION] Running HDemucs v4 vocal isolation...")
+            t_vocals = isolate_vocals_from_audio(wav, sr)
+            wav = t_vocals.cpu().numpy()
+            sr = 16000
+            log_transcribe(f"[VOCAL ISOLATION] Vocal isolation completed successfully.")
+        except Exception as e:
+            log_transcribe(f"[WARN] HDemucs vocal isolation failed: {e}, using original audio")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr != 16000:
+                t_wav = torch.as_tensor(wav, dtype=torch.float32)
+                wav = AF.resample(t_wav, sr, 16000).numpy()
+    else:
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != 16000:
+            t_wav = torch.as_tensor(wav, dtype=torch.float32)
+            wav = AF.resample(t_wav, sr, 16000).numpy()
 
     # Dynamic Loudness / RMS Normalization
     rms = float(np.sqrt(np.mean(wav ** 2)))
@@ -981,10 +1123,13 @@ def transcribe_hybrid_thai(
 
     if not initial_prompt or not initial_prompt.strip():
         initial_prompt = DEFAULT_DRAMA_PROMPT
-    elif "รายการต่อไปนี้" not in initial_prompt:
-        initial_prompt = initial_prompt.strip() + " " + DEFAULT_DRAMA_PROMPT
     else:
-        initial_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
+        clean_user_prompt = re.sub(r'[\s,]*,\s*', ' ', initial_prompt.strip())
+        ending_hints = "นะคะ ครับ ค่ะ จ้ะ"
+        if not any(h in clean_user_prompt for h in ["นะคะ", "ครับ", "ค่ะ"]):
+            initial_prompt = f"{clean_user_prompt} {ending_hints}"
+        else:
+            initial_prompt = clean_user_prompt
 
     # ===== STEP 1: Turbo transcription (full coverage) =====
     segments_gen, info = turbo_model.transcribe(
@@ -995,15 +1140,15 @@ def transcribe_hybrid_thai(
         word_timestamps=True,
         initial_prompt=initial_prompt,
         condition_on_previous_text=False,
-        repetition_penalty=1.04,
+        repetition_penalty=1.15,
         no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
+        compression_ratio_threshold=2.2,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
     )
 
     turbo_segments = list(segments_gen)
-    log_transcribe(f"[HYBRID] Step 1 done: Turbo produced {len(turbo_segments)} raw segments")
+    log_transcribe(f"[HYBRID] Step 1 done: large-v3 produced {len(turbo_segments)} raw segments")
 
     # Convert wav to torch tensor for CTC alignment
     x_16k = torch.as_tensor(wav, dtype=torch.float32)
@@ -1165,7 +1310,7 @@ def transcribe_hybrid_thai(
                     })
                     idx += len(tw)
 
-    log_transcribe(f"[HYBRID] Step 2 done: CTC aligned {ctc_aligned_count} segments, Turbo fallback {turbo_fallback_count} segments")
+    log_transcribe(f"[HYBRID] Step 2 done: CTC aligned {ctc_aligned_count} segments, large-v3 fallback {turbo_fallback_count} segments")
 
     segments = form_dialogue_segments(all_words, max_chars_per_cue, max_pause_sec, min_cue_dur, time_offset=time_offset)
     full_text = " ".join(s["text"] for s in segments)
@@ -1177,7 +1322,7 @@ def transcribe_hybrid_thai(
 @app.on_event("startup")
 def on_startup():
     logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
-    log_transcribe("[READY] GPU Server พร้อมทำงาน (RTX 3090 Dual Engine: Typhoon CTC + Whisper Turbo) - สแตนด์บายรอคิวถอดเสียง...")
+    log_transcribe("[READY] GPU Server พร้อมทำงาน (Dual Engine: Typhoon CTC + Whisper large-v3) - สแตนด์บายรอคิวถอดเสียง...")
 
 @app.get("/")
 @app.get("/health")
@@ -1195,7 +1340,8 @@ async def health_check():
         "service": "dual-engine-subtitle-api",
         "engines": {
             "thai": "typhoon-whisper-large-v3-ctc",
-            "multilingual": "whisper-large-v3-turbo"
+            "multilingual": "whisper-large-v3",
+            "primary": "whisper-large-v3 (32-decoder layers)"
         },
         "gpu": GPU_NAME,
         "vram_gb": GPU_VRAM_GB,
@@ -1329,39 +1475,56 @@ def do_transcription_pipeline(
         segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals, time_offset=offset_val)
         detected_lang = "th"
     elif req_model == "hybrid" or (req_model == "auto" and lang_code in ["th", "thai", "t1"]):
-        engine_label = f"Hybrid (Turbo + Typhoon CTC Align, Offset: {offset_val}s)"
+        engine_label = f"Hybrid (large-v3 + Typhoon CTC Align, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
         segments, combined_text, audio_dur = transcribe_hybrid_thai(
             tmp_path,
             initial_prompt=initial_prompt,
             temperature=temperature,
-            time_offset=offset_val
+            time_offset=offset_val,
+            isolate_vocals=bool(isolate_vocals)
         )
         detected_lang = "th"
     elif lang_code in ["th", "thai", "t1"]:
-        engine_label = f"Faster-Whisper (large-v3-turbo) + Thai Dialogue Tuning (Offset: {offset_val}s)"
+        engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
         segments, combined_text, audio_dur = transcribe_with_turbo_thai(
             tmp_path,
             initial_prompt=initial_prompt,
             temperature=temperature,
-            time_offset=offset_val
+            time_offset=offset_val,
+            isolate_vocals=bool(isolate_vocals)
         )
         detected_lang = "th"
     else:
-        engine_label = f"Faster-Whisper ({req_model or 'large-v3-turbo'})"
+        engine_label = f"Faster-Whisper ({req_model or 'large-v3'})" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
+
+        audio_input = tmp_path
+        if isolate_vocals and demucs_model is not None:
+            try:
+                log_transcribe(f"[VOCAL ISOLATION] Running HDemucs v4 vocal isolation for {lang_code}...")
+                wav, sr = sf.read(tmp_path, dtype="float32")
+                t_vocals = isolate_vocals_from_audio(wav, sr)
+                wav = t_vocals.cpu().numpy()
+                sr = 16000
+                audio_input = wav
+                log_transcribe(f"[VOCAL ISOLATION] Vocal isolation completed successfully.")
+            except Exception as e:
+                log_transcribe(f"[WARN] HDemucs vocal isolation failed: {e}, using original audio")
+                audio_input = tmp_path
+
         segments_gen, info = turbo_model.transcribe(
-            tmp_path,
+            audio_input,
             language=lang_code if lang_code != "auto" else None,
             temperature=temperature,
             initial_prompt=initial_prompt,
             beam_size=5,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=300)
         )
         segments = []
         full_text_list = []
@@ -1533,6 +1696,31 @@ def async_webhook_worker(
         except:
             pass
 
+class LearnCharactersRequest(BaseModel):
+    drama_title: str
+    characters: Union[str, List[str]]
+    actors: Optional[Union[str, List[str]]] = None
+
+@app.post("/v1/characters/learn")
+def api_learn_characters(req: LearnCharactersRequest):
+    new_cnt = learn_drama_characters(req.drama_title, req.characters, req.actors)
+    return {
+        "status": "ok",
+        "drama_title": req.drama_title,
+        "new_words_learned": new_cnt,
+        "total_dramas_in_library": len(DRAMA_KNOWLEDGE),
+        "total_vocabulary_in_trie": len(GLOBAL_VOCAB_SET)
+    }
+
+@app.get("/v1/characters/stats")
+def api_characters_stats():
+    return {
+        "status": "ok",
+        "total_dramas": len(DRAMA_KNOWLEDGE),
+        "total_vocabulary": len(GLOBAL_VOCAB_SET),
+        "sample_dramas": list(DRAMA_KNOWLEDGE.keys())[:15]
+    }
+
 @app.post("/v1/audio/transcriptions")
 def transcribe(
     file: UploadFile = File(...),
@@ -1542,6 +1730,7 @@ def transcribe(
     temperature: Optional[float] = Form(0.0),
     prompt: Optional[str] = Form(None),
     drama_title: Optional[str] = Form(None),
+    characters: Optional[str] = Form(None),
     isolate_vocals: Optional[bool] = Form(False),
     time_offset: Optional[float] = Form(-0.15),
     diarize: Optional[bool] = Form(False),
@@ -1557,14 +1746,48 @@ def transcribe(
     start_ts = time.time()
     orig_filename = os.path.basename(file.filename or "audio.mp3")
 
-    # Centralized Prompt Builder on GPU: combine drama_title + prompt if supplied
+    # 1. Clean drama title or extract from filename
     title_clean = ""
     if drama_title and drama_title.strip():
         title_clean = re.sub(r'(ตอนที่|\s*ep\.?\s*\d+|disc\s*\d+)', '', drama_title.strip(), flags=re.IGNORECASE).strip()
+    if not title_clean and orig_filename:
+        m = re.match(r'^([a-zA-Z0-9_\u0E00-\u0E7F-]+?)(?:-|_|\.|$)', orig_filename)
+        if m:
+            extracted = re.sub(r'(disc\s*\d+|ep\.?\s*\d+|_\d+k)', '', m.group(1), flags=re.IGNORECASE).strip()
+            if len(extracted) >= 3:
+                title_clean = extracted
 
+    # 2. Auto-learn characters if supplied by user/admin
+    if characters and characters.strip():
+        learn_drama_characters(title_clean or orig_filename, characters)
+
+    # 3. Retrieve all known characters (accumulated from library + newly learned)
+    known_chars = get_known_characters(title_clean or orig_filename)
+    if characters and characters.strip():
+        user_c_list = [c.strip() for c in re.split(r'[,\|\n\/]+', characters) if c.strip()]
+        for uc in user_c_list:
+            if uc not in known_chars:
+                known_chars.append(uc)
+
+    # 4. Centralized Prompt Builder on GPU
     prompt_parts = []
-    if title_clean:
-        prompt_parts.append(f"บทสนทนาละครเรื่อง {title_clean}")
+    clean_lang = (language or "th").strip().lower()
+    if clean_lang in ["ko", "korean"]:
+        if title_clean:
+            prompt_parts.append(title_clean)
+        if known_chars:
+            prompt_parts.append(", ".join(known_chars[:15]))
+    elif clean_lang in ["zh", "chinese", "cn"]:
+        if title_clean:
+            prompt_parts.append(title_clean)
+        if known_chars:
+            prompt_parts.append(", ".join(known_chars[:15]))
+    else:
+        if title_clean:
+            prompt_parts.append(f"บทสนทนาละครเรื่อง {title_clean}")
+        if known_chars:
+            chars_str = ", ".join(known_chars[:15])
+            prompt_parts.append(f"ตัวละคร: {chars_str}")
     if prompt and prompt.strip():
         p_str = prompt.strip()
         if p_str not in prompt_parts:
