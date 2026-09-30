@@ -731,31 +731,63 @@ def check_ollama_available(ollama_url: str = "http://127.0.0.1:11434") -> bool:
     except Exception:
         return False
 
-def refine_subtitles_with_llm(
+# Cache for resolved Master LLM URL
+_CACHED_MASTER_LLM_URL = None
+_CACHED_MASTER_LLM_TIME = 0.0
+
+def get_master_llm_url() -> str:
+    """
+    Resolve the Central Master LLM URL in order of priority:
+    1. Environment variable MASTER_LLM_URL (e.g. 'http://65.7.31.69:40316')
+    2. Dynamic discovery query to Storage Server: http://ph.cdnwatch.com/subtitle.php?action=get_master_llm
+    3. Statically configured Master Node: http://65.7.31.69:40316 (dedicated port) or http://65.7.31.69:40389 (unified port)
+    """
+    global _CACHED_MASTER_LLM_URL, _CACHED_MASTER_LLM_TIME
+    env_url = os.environ.get("MASTER_LLM_URL")
+    if env_url and env_url.strip():
+        return env_url.strip().rstrip("/")
+
+    now = time.time()
+    if _CACHED_MASTER_LLM_URL and (now - _CACHED_MASTER_LLM_TIME < 300):
+        return _CACHED_MASTER_LLM_URL
+
+    storage_candidates = [
+        "http://ph.cdnwatch.com/subtitle.php?action=get_master_llm",
+        "http://23.158.40.152/subtitle.php?action=get_master_llm"
+    ]
+    for surl in storage_candidates:
+        try:
+            req = urllib.request.Request(surl, headers={"User-Agent": "AutoSub-DynamicNode"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    m_url = data.get("master_llm_url") or data.get("master_url")
+                    if m_url:
+                        _CACHED_MASTER_LLM_URL = m_url.rstrip("/")
+                        _CACHED_MASTER_LLM_TIME = now
+                        log_transcribe(f"[STEP 6 LLM] Discovered Central Master LLM URL: {_CACHED_MASTER_LLM_URL}")
+                        return _CACHED_MASTER_LLM_URL
+        except Exception:
+            pass
+
+    _CACHED_MASTER_LLM_URL = "http://65.7.31.69:40316"
+    _CACHED_MASTER_LLM_TIME = now
+    return _CACHED_MASTER_LLM_URL
+
+def _run_local_ollama_refinement(
     segments: list,
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
     ollama_url: str = "http://127.0.0.1:11434",
     model: str = "qwen2.5:7b",
     batch_size: int = 25
-) -> list:
+) -> tuple:
     """
-    Step 6: LLM Contextual Refinement (Qwen2.5-7B-Instruct via Ollama)
-    - Batches of 20-25 cues sent as compact JSON key-value pairs {"0": "...", "1": "..."}.
-    - Grammar-constrained JSON mode ("format": "json") prevents extra commentary and ensures rapid generation (~8-12s per batch).
-    - Preserves exact timestamps (start/end) 100% untouched.
-    - Explicitly resolves ASR homophones and restores character names based on drama knowledge.
-    - Automatically and safely keeps original cues if Ollama is unreachable or on parsing error.
+    Executes local Qwen2.5-7B contextual proofreading via Ollama.
+    Returns (refined_segments, total_corrected, duration_sec).
     """
-    if not segments:
-        return segments
-
-    if not check_ollama_available(ollama_url):
-        log_transcribe(f"[STEP 6 LLM NOTICE] Ollama service not reachable at {ollama_url}. Safely keeping Step 5 cues.")
-        return segments
-
     t_llm_start = time.time()
-    log_transcribe(f"[STEP 6 LLM] Starting Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
+    log_transcribe(f"[STEP 6 LOCAL LLM] Starting local Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
 
     char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
     system_prompt = (
@@ -821,14 +853,108 @@ def refine_subtitles_with_llm(
                                 s["text"] = new_text
                                 total_corrected += 1
                 else:
-                    log_transcribe(f"[STEP 6 LLM WARN] Batch {i//batch_size + 1}: JSON is not a dict, keeping original cues.")
+                    log_transcribe(f"[STEP 6 LOCAL LLM WARN] Batch {i//batch_size + 1}: JSON is not a dict, keeping original cues.")
         except Exception as ex:
-            log_transcribe(f"[STEP 6 LLM WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
+            log_transcribe(f"[STEP 6 LOCAL LLM WARN] Batch {i//batch_size + 1} failed: {ex}. Keeping original cues.")
             continue
 
     llm_dur = round(time.time() - t_llm_start, 2)
-    log_transcribe(f"[STEP 6 LLM COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully in {llm_dur}s (Timestamps 100% preserved).")
-    return refined_segments
+    log_transcribe(f"[STEP 6 LOCAL LLM COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully in {llm_dur}s (Timestamps 100% preserved).")
+    return refined_segments, total_corrected, llm_dur
+
+def _run_remote_master_llm_refinement(
+    segments: list,
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    model: str = "qwen2.5:7b",
+    batch_size: int = 25
+) -> list:
+    """
+    Delegates Step 6 LLM refinement from Dynamic Node to Central Master LLM.
+    Fail-safe: Returns original Step 5 cues if Master is busy, offline, or returns error.
+    """
+    master_url = get_master_llm_url()
+    t_start = time.time()
+    log_transcribe(f"[STEP 6 CENTRAL LLM] Delegating {len(segments)} cues to Central Master LLM ({master_url})...")
+
+    endpoints = [f"{master_url}/v1/llm/refine"]
+    if ":40316" in master_url:
+        endpoints.append(master_url.replace(":40316", ":40389") + "/v1/llm/refine")
+    elif ":40389" in master_url:
+        endpoints.append(master_url.replace(":40389", ":40316") + "/v1/llm/refine")
+
+    payload_data = {
+        "segments": segments,
+        "drama_title": drama_title,
+        "known_chars": known_chars or [],
+        "model": model,
+        "batch_size": batch_size
+    }
+    req_body = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
+
+    for endpoint in endpoints:
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                data=req_body,
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-DynamicNode"}
+            )
+            with urllib.request.urlopen(req, timeout=90.0) as resp:
+                if resp.status == 200:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    status = res_json.get("status")
+                    if status == "success" and "segments" in res_json:
+                        corrected_count = res_json.get("corrected_count", 0)
+                        dur = round(time.time() - t_start, 2)
+                        log_transcribe(f"[STEP 6 CENTRAL LLM SUCCESS] Central Master LLM refined {corrected_count} cues in {dur}s (Exact timestamps preserved).")
+                        return res_json["segments"]
+                    elif status in ("fallback", "busy_fallback"):
+                        log_transcribe(f"[STEP 6 CENTRAL LLM NOTICE] Master LLM reported {status} ({res_json.get('message')}). Safely keeping Step 5 cues.")
+                        return segments
+        except Exception as ex:
+            log_transcribe(f"[STEP 6 CENTRAL LLM WARN] Request to {endpoint} failed: {ex}. Trying next endpoint...")
+
+    log_transcribe("[STEP 6 CENTRAL LLM NOTICE] All Central Master LLM endpoints unreachable or timed out. Safely keeping Step 5 cues.")
+    return segments
+
+def refine_subtitles_with_llm(
+    segments: list,
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    ollama_url: str = "http://127.0.0.1:11434",
+    model: str = "qwen2.5:7b",
+    batch_size: int = 25
+) -> list:
+    """
+    Step 6: LLM Contextual Refinement (Approach A: Central Master LLM Architecture)
+    - If local Ollama is available (Master Node): Runs local inference directly.
+    - If local Ollama is not present (Dynamic Node): Delegates to Central Master LLM via HTTP.
+    - Timestamps (start/end) are 100% preserved.
+    - If LLM is unreachable or busy: Safely returns Step 5 cues without error.
+    """
+    if not segments:
+        return segments
+
+    # 1. If local Ollama exists (Master Node), run locally
+    if check_ollama_available(ollama_url):
+        refined, _, _ = _run_local_ollama_refinement(
+            segments=segments,
+            drama_title=drama_title,
+            known_chars=known_chars,
+            ollama_url=ollama_url,
+            model=model,
+            batch_size=batch_size
+        )
+        return refined
+    else:
+        # 2. Dynamic Node: Delegate to Central Master LLM
+        return _run_remote_master_llm_refinement(
+            segments=segments,
+            drama_title=drama_title,
+            known_chars=known_chars,
+            model=model,
+            batch_size=batch_size
+        )
 
 DEFAULT_DRAMA_PROMPT = (
     "บทสนทนาภาษาไทยทั่วไป ละครและซีรีส์: "
@@ -1872,6 +1998,42 @@ def api_characters_stats():
         "total_dramas": len(DRAMA_KNOWLEDGE),
         "total_vocabulary": len(GLOBAL_VOCAB_SET),
         "sample_dramas": list(DRAMA_KNOWLEDGE.keys())[:15]
+    }
+
+class RefineSubtitlesRequest(BaseModel):
+    segments: List[dict]
+    drama_title: Optional[str] = None
+    known_chars: Optional[List[str]] = None
+    model: Optional[str] = "qwen2.5:7b"
+    batch_size: Optional[int] = 25
+
+@app.post("/v1/llm/refine")
+def api_llm_refine(req: RefineSubtitlesRequest):
+    """
+    Central Master LLM Endpoint (Port 10100)
+    Accepts refinement requests from dynamic nodes when running on Master Node.
+    """
+    if not check_ollama_available():
+        return {
+            "status": "fallback",
+            "message": "Local Ollama not available on this node",
+            "corrected_count": 0,
+            "segments": req.segments,
+            "duration_sec": 0.0
+        }
+    
+    refined, corrected, dur = _run_local_ollama_refinement(
+        segments=req.segments,
+        drama_title=req.drama_title,
+        known_chars=req.known_chars,
+        model=req.model or "qwen2.5:7b",
+        batch_size=req.batch_size or 25
+    )
+    return {
+        "status": "success",
+        "corrected_count": corrected,
+        "segments": refined,
+        "duration_sec": dur
     }
 
 @app.post("/v1/audio/transcriptions")
