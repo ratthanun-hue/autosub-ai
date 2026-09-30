@@ -1423,8 +1423,10 @@ def transcribe_hybrid_thai(
                     idx += len(tw)
 
     log_transcribe(f"[HYBRID] Step 2 done: CTC aligned {ctc_aligned_count} segments, large-v3 fallback {turbo_fallback_count} segments")
+    log_transcribe(f"[HYBRID] Step 3 done: PyThaiNLP word grouping with Drama Trie ({len(all_words)} words)")
 
     segments = form_dialogue_segments(all_words, max_chars_per_cue, max_pause_sec, min_cue_dur, time_offset=time_offset)
+    log_transcribe(f"[HYBRID] Step 4 done: Dialogue segmentation produced {len(segments)} timed cues")
     full_text = " ".join(s["text"] for s in segments)
     return segments, full_text, total_duration
 
