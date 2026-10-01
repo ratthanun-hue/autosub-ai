@@ -12,6 +12,7 @@ import os
 import re
 import time
 import json
+import math
 import logging
 import threading
 import subprocess
@@ -63,6 +64,20 @@ class RefineRequest(BaseModel):
     known_chars: Optional[List[str]] = None
     model: Optional[str] = DEFAULT_MODEL
     batch_size: Optional[int] = 25
+
+class AsyncRefineRequest(BaseModel):
+    segments: List[Dict[str, Any]]
+    drama_title: Optional[str] = None
+    known_chars: Optional[List[str]] = None
+    model: Optional[str] = DEFAULT_MODEL
+    batch_size: Optional[int] = 25
+    webhook_url: str
+    webhook_secret: Optional[str] = None
+    token: Optional[str] = None
+    custom_id: Optional[str] = None
+    filename: Optional[str] = None
+    duration: Optional[float] = 0.0
+    processing_time_worker: Optional[float] = 0.0
 
 class TranslateRequest(BaseModel):
     segments: Optional[List[Dict[str, Any]]] = None
@@ -206,9 +221,9 @@ def refine_subtitles(req_data: RefineRequest):
             "duration_sec": 0.0
         }
 
-    acquired = LLM_SEMAPHORE.acquire(timeout=60.0)
+    acquired = LLM_SEMAPHORE.acquire(timeout=600.0)
     if not acquired:
-        logger.warning(f"Master LLM semaphore timeout after 60s for drama '{drama_title}'. Returning original cues.")
+        logger.warning(f"Master LLM semaphore timeout after 600s for drama '{drama_title}'. Returning original cues.")
         return {
             "status": "busy_fallback",
             "message": "Master LLM queue busy",
@@ -318,6 +333,235 @@ def refine_subtitles(req_data: RefineRequest):
         with active_requests_lock:
             active_requests -= 1
         LLM_SEMAPHORE.release()
+
+# ==============================================================================
+# 1.1 ASYNC CONTEXTUAL THAI PROOFREADING (Async Webhook Delegation)
+# ==============================================================================
+def format_timestamp(seconds: float, vtt: bool = False) -> str:
+    hours = math.floor(seconds / 3600)
+    minutes = math.floor((seconds % 3600) / 60)
+    secs = math.floor(seconds % 60)
+    msecs = math.floor((seconds - math.floor(seconds)) * 1000)
+    sep = "." if vtt else ","
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{msecs:03d}"
+
+def send_webhook_callback(url: str, payload: dict, retries: int = 3, delay: float = 3.0) -> bool:
+    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={'Content-Type': 'application/json; charset=utf-8', 'User-Agent': 'AutoSub-MasterLLM-Webhook/1.0'}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status in [200, 201, 202, 204]:
+                    logger.info(f"[WEBHOOK SUCCESS] Callback sent to {url} (Attempt {attempt}, HTTP {resp.status})")
+                    return True
+        except Exception as ex:
+            logger.warning(f"[WEBHOOK RETRY {attempt}/{retries}] Failed to send to {url}: {ex}")
+            if attempt < retries:
+                time.sleep(delay)
+    return False
+
+def _send_fallback_webhook(job: AsyncRefineRequest, reason: str):
+    try:
+        custom_id = job.custom_id or "unknown"
+        logger.warning(f"Sending fallback webhook for custom_id='{custom_id}' due to: {reason}")
+        # Format VTT with Step 5 cues
+        vtt_lines = ["WEBVTT\n"]
+        for s in job.segments:
+            vtt_lines.append(f"{format_timestamp(s['start'], vtt=True)} --> {format_timestamp(s['end'], vtt=True)}")
+            spk = s.get("speaker")
+            txt = s.get("text", "")
+            if spk:
+                vtt_lines.append(f"<v {spk}>{txt}\n")
+            else:
+                vtt_lines.append(f"{txt}\n")
+        vtt_out = "\n".join(vtt_lines)
+        combined_text = " ".join(s.get("text", "") for s in job.segments)
+
+        webhook_payload = {
+            "status": "completed",
+            "custom_id": custom_id,
+            "token": job.webhook_secret or job.token,
+            "filename": job.filename or f"sub_{custom_id}.mp3",
+            "duration": job.duration or 0.0,
+            "processing_time": job.processing_time_worker or 0.0,
+            "text": combined_text,
+            "vtt": vtt_out,
+            "segments": job.segments,
+            "step6_refined": False,
+            "notice": reason
+        }
+        send_webhook_callback(job.webhook_url, webhook_payload)
+    except Exception as e:
+        logger.error(f"Failed to send fallback webhook: {e}")
+
+def _process_async_refine(job: AsyncRefineRequest):
+    global active_requests, total_completed_jobs
+    t_start = time.time()
+    custom_id = job.custom_id or "unknown"
+    logger.info(f"[ASYNC START] Processing Thai refinement for custom_id='{custom_id}', drama='{job.drama_title}', cues={len(job.segments)}")
+    
+    with active_requests_lock:
+        active_requests += 1
+
+    # Generous queue timeout (30 mins) so no job is dropped
+    acquired = LLM_SEMAPHORE.acquire(timeout=1800.0)
+    if not acquired:
+        logger.error(f"[ASYNC TIMEOUT] Semaphore queue timeout for custom_id='{custom_id}'")
+        with active_requests_lock:
+            active_requests -= 1
+        _send_fallback_webhook(job, "LLM queue busy")
+        return
+
+    try:
+        segments = [dict(s) for s in job.segments]
+        drama_title = job.drama_title or "ทั่วไป"
+        known_chars = job.known_chars or []
+        model = job.model or DEFAULT_MODEL
+        if model in ("qwen2.5:7b", "qwen2.5", ""):
+            model = DEFAULT_MODEL
+        batch_size = max(10, min(job.batch_size or 25, 40))
+
+        char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
+        system_prompt = (
+            f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
+            f"ภารกิจ: เกลาบริบทบทสนทนาและแก้ไขคำที่ระบบฟังเสียงพูด (ASR/Whisper) ฟังเพี้ยนหรือพ้องเสียง (Contextual Homophones)\n"
+            f"ข้อมูลละคร: เรื่อง '{drama_title}'\n"
+            f"รายชื่อตัวละครหลัก: {char_str}\n\n"
+            "กฎเหล็กในการตรวจแก้:\n"
+            "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก เช่น หากได้ยินชื่อเพี้ยนหรือพ้องเสียงใกล้เคียง (เช่น พี่ดนทร์/พี่ผู้ชม/พี่โดน -> พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี -> เนตรศิริ) ให้แก้เป็นชื่อตัวละครที่ถูกต้องตามบริบท\n"
+            "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น:\n"
+            "   - เสียงพยัญชนะ/สระเพี้ยน: 'เต้นความ' -> 'แจ้งความ', 'จุดรวช' -> 'ตำรวจ', 'พลิกแฟร์ม' -> 'พลิกแฟ้ม', 'แล่ว' -> 'แล้ว', 'เหน' -> 'เห็น'\n"
+            "   - คำไม่มีความหมายหรือผิดไวยากรณ์: 'โมโมง/มองหมอก' -> 'หมองมัว', 'สาปศูนย์' -> 'สาบสูญ'\n"
+            "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
+            "4. ส่งผลลัพธ์กลับมาเป็น JSON Object ตาม ID เดิมเป๊ะ ในรูปแบบ {{\"ID\": \"ข้อความ\"}}"
+        )
+
+        total_corrected = 0
+        for i in range(0, len(segments), batch_size):
+            chunk = segments[i:i + batch_size]
+            cues_dict = {str(s.get("id", idx)): s.get("text", "") for idx, s in enumerate(chunk, start=i)}
+
+            try:
+                payload = {
+                    "model": model,
+                    "format": "json",
+                    "stream": False,
+                    "keep_alive": -1,
+                    "options": {"temperature": 0.1, "num_predict": 2048},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้:\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
+                    ]
+                }
+                req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{OLLAMA_URL}/api/chat",
+                    data=req_body,
+                    headers={"Content-Type": "application/json; charset=utf-8"}
+                )
+                with urllib.request.urlopen(req, timeout=120.0) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    content = resp_json.get("message", {}).get("content", "").strip()
+
+                    corr_map = {}
+                    try:
+                        corr_map = json.loads(content)
+                    except Exception:
+                        m = re.search(r'\{.*\}', content, re.DOTALL)
+                        if m:
+                            corr_map = json.loads(m.group(0))
+
+                    if isinstance(corr_map, dict):
+                        for idx, s in enumerate(chunk, start=i):
+                            sid = str(s.get("id", idx))
+                            if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
+                                new_text = corr_map[sid].strip()
+                                if new_text != s.get("text", ""):
+                                    s["text"] = new_text
+                                    total_corrected += 1
+            except Exception as b_err:
+                logger.warning(f"Batch {i // batch_size + 1} async refine warning: {b_err}. Keeping original cues.")
+                continue
+
+        dur = round(time.time() - t_start, 2)
+        total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
+        logger.info(f"[ASYNC SUCCESS] Refined {total_corrected} cues in {dur}s for custom_id='{custom_id}' (Total time: {total_proc}s). Delivering webhook...")
+
+        # Format VTT
+        vtt_lines = ["WEBVTT\n"]
+        for s in segments:
+            vtt_lines.append(f"{format_timestamp(s['start'], vtt=True)} --> {format_timestamp(s['end'], vtt=True)}")
+            spk = s.get("speaker")
+            txt = s.get("text", "")
+            if spk:
+                vtt_lines.append(f"<v {spk}>{txt}\n")
+            else:
+                vtt_lines.append(f"{txt}\n")
+        vtt_out = "\n".join(vtt_lines)
+
+        # Format SRT
+        srt_lines = []
+        for i_idx, s in enumerate(segments, 1):
+            srt_lines.append(str(i_idx))
+            srt_lines.append(f"{format_timestamp(s['start'], vtt=False)} --> {format_timestamp(s['end'], vtt=False)}")
+            spk = s.get("speaker")
+            txt = s.get("text", "")
+            if spk:
+                srt_lines.append(f"[{spk}]: {txt}\n")
+            else:
+                srt_lines.append(f"{txt}\n")
+        srt_out = "\n".join(srt_lines)
+        combined_text = " ".join(s.get("text", "") for s in segments)
+
+        webhook_payload = {
+            "status": "completed",
+            "custom_id": custom_id,
+            "token": job.webhook_secret or job.token,
+            "filename": job.filename or f"sub_{custom_id}.mp3",
+            "duration": job.duration or 0.0,
+            "processing_time": total_proc,
+            "text": combined_text,
+            "vtt": vtt_out,
+            "srt": srt_out,
+            "segments": segments,
+            "step6_refined": True,
+            "corrected_count": total_corrected
+        }
+        send_webhook_callback(job.webhook_url, webhook_payload)
+
+        with total_completed_lock:
+            total_completed_jobs += 1
+
+    except Exception as ex:
+        logger.error(f"[ASYNC ERROR] Unexpected error for custom_id='{custom_id}': {ex}")
+        _send_fallback_webhook(job, str(ex))
+    finally:
+        with active_requests_lock:
+            active_requests -= 1
+        LLM_SEMAPHORE.release()
+
+@app.post("/v1/llm/refine_async")
+def refine_subtitles_async(req_data: AsyncRefineRequest):
+    if not req_data.segments:
+        raise HTTPException(status_code=400, detail="segments list cannot be empty")
+    if not req_data.webhook_url:
+        raise HTTPException(status_code=400, detail="webhook_url is required for async refinement")
+
+    logger.info(f"Queuing async refinement for custom_id='{req_data.custom_id}', cues={len(req_data.segments)}")
+    t = threading.Thread(target=_process_async_refine, args=(req_data,), daemon=True)
+    t.start()
+
+    return {
+        "status": "queued",
+        "custom_id": req_data.custom_id,
+        "message": "Thai subtitle refinement queued asynchronously. Result will be posted to webhook.",
+        "cues_count": len(req_data.segments),
+        "drama_title": req_data.drama_title
+    }
 
 # ==============================================================================
 # 2. MULTILINGUAL SUBTITLE TRANSLATION

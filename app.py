@@ -899,7 +899,9 @@ def _run_remote_master_llm_refinement(
                 data=req_body,
                 headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-DynamicNode"}
             )
-            with urllib.request.urlopen(req, timeout=90.0) as resp:
+            # Dynamic timeout: Allow at least 180s, scaling with cue count (e.g. 1000 cues = ~380s)
+            req_timeout = max(180.0, float(len(segments) * 0.35 + 30.0))
+            with urllib.request.urlopen(req, timeout=req_timeout) as resp:
                 if resp.status == 200:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     status = res_json.get("status")
@@ -955,6 +957,71 @@ def refine_subtitles_with_llm(
             model=model,
             batch_size=batch_size
         )
+
+def delegate_async_refine_to_master(
+    segments: list,
+    drama_title: Optional[str] = None,
+    known_chars: Optional[List[str]] = None,
+    webhook_url: str = "",
+    webhook_secret: Optional[str] = None,
+    custom_id: Optional[str] = None,
+    orig_filename: str = "",
+    duration: float = 0.0,
+    processing_time_worker: float = 0.0,
+    model: str = "qwen2.5:14b",
+    batch_size: int = 25
+) -> bool:
+    """
+    Hands off Step 5 Thai cues to Central Master LLM for asynchronous Step 6 refinement.
+    Master LLM accepts immediately (status: queued) and will send the final Step 6 WebVTT
+    directly to the Storage Server webhook_url once finished.
+    This frees the Worker GPU immediately!
+    """
+    if not segments or not webhook_url:
+        return False
+
+    master_url = get_master_llm_url()
+    log_transcribe(f"[STEP 6 ASYNC HANDOFF] Delegating {len(segments)} Thai cues to Central Master LLM ({master_url}/v1/llm/refine_async)...")
+
+    endpoints = [f"{master_url}/v1/llm/refine_async"]
+    if "23.158.40.152" in master_url:
+        endpoints.append("http://162.200.81.25:64019/v1/llm/refine_async")
+    elif "162.200.81.25" in master_url:
+        endpoints.append("http://23.158.40.152/v1/llm/refine_async")
+
+    payload_data = {
+        "segments": segments,
+        "drama_title": drama_title or "ทั่วไป",
+        "known_chars": known_chars or [],
+        "model": model,
+        "batch_size": batch_size,
+        "webhook_url": webhook_url,
+        "webhook_secret": webhook_secret,
+        "token": webhook_secret,
+        "custom_id": custom_id,
+        "filename": orig_filename,
+        "duration": duration,
+        "processing_time_worker": processing_time_worker
+    }
+    req_body = json.dumps(payload_data, ensure_ascii=False).encode("utf-8")
+
+    for endpoint in endpoints:
+        try:
+            req = urllib.request.Request(
+                endpoint,
+                data=req_body,
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-WorkerNode"}
+            )
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                if resp.status in (200, 201, 202):
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    if res_json.get("status") == "queued":
+                        log_transcribe(f"[STEP 6 ASYNC SUCCESS] Central Master LLM acknowledged queued (custom_id: {custom_id}) via {endpoint}.")
+                        return True
+        except Exception as ex:
+            log_transcribe(f"[STEP 6 ASYNC NOTICE] Endpoint {endpoint} failed: {ex}. Trying next...")
+
+    return False
 
 DEFAULT_DRAMA_PROMPT = (
     "บทสนทนาภาษาไทยทั่วไป ละครและซีรีส์: "
@@ -1708,8 +1775,10 @@ def do_transcription_pipeline(
     known_chars: Optional[List[str]] = None,
     refine_llm: Optional[bool] = True
 ):
-    lang_code = (language or "th").strip().lower()
-    req_model = (model_name or "auto").strip().lower()
+    # Pipeline is strictly dedicated to Thai speech recognition & refinement
+    # Other languages are translated from Thai subtitles via timedtext.php
+    lang_code = "th"
+    req_model = (model_name or "hybrid").strip().lower()
     offset_val = 0.0 if time_offset is None else float(time_offset)
 
     if req_model in ["typhoon", "typhoon-ctc"]:
@@ -1717,7 +1786,20 @@ def do_transcription_pipeline(
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals, time_offset=offset_val)
         detected_lang = "th"
-    elif req_model == "hybrid" or (req_model == "auto" and lang_code in ["th", "thai", "t1"]):
+    elif req_model == "turbo" or req_model == "large-v3-thai":
+        engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
+        log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
+        initial_prompt = prompt.strip() if prompt and prompt.strip() else None
+        segments, combined_text, audio_dur = transcribe_with_turbo_thai(
+            tmp_path,
+            initial_prompt=initial_prompt,
+            temperature=temperature,
+            time_offset=offset_val,
+            isolate_vocals=bool(isolate_vocals)
+        )
+        detected_lang = "th"
+    else:
+        # Default: Hybrid SOTA Thai (large-v3 + Typhoon CTC Align)
         engine_label = f"Hybrid (large-v3 + Typhoon CTC Align, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
@@ -1736,61 +1818,6 @@ def do_transcription_pipeline(
                     s["text"] = re.sub(r'เหมือนกัน่ะ', 'เหมือนกันน่ะ', s["text"])
             combined_text = " ".join(s["text"] for s in segments)
         detected_lang = "th"
-    elif lang_code in ["th", "thai", "t1"]:
-        engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
-        log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
-        initial_prompt = prompt.strip() if prompt and prompt.strip() else None
-        segments, combined_text, audio_dur = transcribe_with_turbo_thai(
-            tmp_path,
-            initial_prompt=initial_prompt,
-            temperature=temperature,
-            time_offset=offset_val,
-            isolate_vocals=bool(isolate_vocals)
-        )
-        detected_lang = "th"
-    else:
-        engine_label = f"Faster-Whisper ({req_model or 'large-v3'})" + (" + HDemucs" if isolate_vocals else "")
-        log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
-        initial_prompt = prompt.strip() if prompt and prompt.strip() else None
-
-        audio_input = tmp_path
-        if isolate_vocals and demucs_model is not None:
-            try:
-                log_transcribe(f"[VOCAL ISOLATION] Running HDemucs v4 vocal isolation for {lang_code}...")
-                wav, sr = sf.read(tmp_path, dtype="float32")
-                t_vocals = isolate_vocals_from_audio(wav, sr)
-                wav = t_vocals.cpu().numpy()
-                sr = 16000
-                audio_input = wav
-                log_transcribe(f"[VOCAL ISOLATION] Vocal isolation completed successfully.")
-            except Exception as e:
-                log_transcribe(f"[WARN] HDemucs vocal isolation failed: {e}, using original audio")
-                audio_input = tmp_path
-
-        segments_gen, info = turbo_model.transcribe(
-            audio_input,
-            language=lang_code if lang_code != "auto" else None,
-            temperature=temperature,
-            initial_prompt=initial_prompt,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=300)
-        )
-        segments = []
-        full_text_list = []
-        for s in segments_gen:
-            t = s.text.strip()
-            if t:
-                full_text_list.append(t)
-                segments.append({
-                    "id": s.id,
-                    "start": round(s.start, 3),
-                    "end": round(s.end, 3),
-                    "text": t
-                })
-        combined_text = " ".join(full_text_list)
-        audio_dur = round(info.duration, 2)
-        detected_lang = info.language
 
     # Speaker Diarization via pyannote.audio
     if diarize:
@@ -1807,7 +1834,7 @@ def do_transcription_pipeline(
             log_transcribe(f"[DIARIZATION NOTICE] Skipped due to error: {_d_err}")
 
     # Step 5: Thai Regex & Phonetic Dictionary Corrections
-    if lang_code in ["th", "thai", "t1"] and segments:
+    if segments:
         step5_corrections = 0
         for s in segments:
             orig_t = s["text"]
@@ -1817,8 +1844,8 @@ def do_transcription_pipeline(
                 step5_corrections += 1
         log_transcribe(f"[STEP 5 DICTIONARY] Applied 1,077 Thai rules across {len(segments)} cues ({step5_corrections} cues modified)")
 
-    # Step 6: Contextual Refinement via Fast Local LLM (Qwen2.5-7B)
-    if refine_llm and segments and lang_code in ["th", "thai", "t1"]:
+    # Step 6: Contextual Refinement via Fast Local/Remote LLM (Synchronous fallback)
+    if refine_llm and segments:
         try:
             if not known_chars and drama_title:
                 known_chars = get_known_characters(drama_title)
@@ -1903,14 +1930,34 @@ def async_webhook_worker(
     global active_jobs, total_jobs_completed, last_active_time
     token = current_file_ctx.set(orig_filename)
     try:
+        # Step 1 to 5 on Worker (refine_llm=False so Worker doesn't block on Step 6)
         res = do_transcription_pipeline(
-            tmp_path, orig_filename, model_name, language, "verbose_json",
+            tmp_path, orig_filename, model_name, "th", "verbose_json",
             temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb,
             diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
-            drama_title=drama_title, known_chars=known_chars, refine_llm=refine_llm
+            drama_title=drama_title, known_chars=known_chars, refine_llm=False
         )
-        if isinstance(res, dict):
-            # Format VTT
+        if isinstance(res, dict) and res.get("segments"):
+            # Step 6: Async Webhook handoff to Central Master LLM
+            if refine_llm:
+                handed_off = delegate_async_refine_to_master(
+                    segments=res["segments"],
+                    drama_title=drama_title,
+                    known_chars=known_chars,
+                    webhook_url=webhook_url,
+                    webhook_secret=webhook_secret,
+                    custom_id=custom_id,
+                    orig_filename=orig_filename,
+                    duration=res.get("duration", 0.0),
+                    processing_time_worker=res.get("processing_time", 0.0)
+                )
+                if handed_off:
+                    log_transcribe(f"[STEP 6 ASYNC DELEGATED] Handed off {len(res['segments'])} Thai cues to Central Master LLM (custom_id: {custom_id}). Worker GPU is now freed!")
+                    return
+                else:
+                    log_transcribe(f"[STEP 6 ASYNC NOTICE] Central Master LLM async handoff failed or offline. Delivering Step 5 cues directly.")
+
+            # Fallback (or refine_llm=False): Format VTT/SRT and send directly to Storage Server
             vtt_lines = ["WEBVTT\n"]
             for s in res.get("segments", []):
                 vtt_lines.append(f"{format_timestamp(s['start'], vtt=True)} --> {format_timestamp(s['end'], vtt=True)}")
@@ -1945,7 +1992,8 @@ def async_webhook_worker(
                 "text": res.get("text", ""),
                 "vtt": vtt_out,
                 "srt": srt_out,
-                "segments": res.get("segments", [])
+                "segments": res.get("segments", []),
+                "step6_refined": False
             }
             send_webhook_callback(webhook_url, payload)
     except Exception as e:
@@ -2100,25 +2148,13 @@ def transcribe(
             if uc not in known_chars:
                 known_chars.append(uc)
 
-    # 4. Centralized Prompt Builder on GPU
+    # 4. Centralized Prompt Builder on GPU (Thai Only)
     prompt_parts = []
-    clean_lang = (language or "th").strip().lower()
-    if clean_lang in ["ko", "korean"]:
-        if title_clean:
-            prompt_parts.append(title_clean)
-        if known_chars:
-            prompt_parts.append(", ".join(known_chars[:15]))
-    elif clean_lang in ["zh", "chinese", "cn"]:
-        if title_clean:
-            prompt_parts.append(title_clean)
-        if known_chars:
-            prompt_parts.append(", ".join(known_chars[:15]))
-    else:
-        if title_clean:
-            prompt_parts.append(f"บทสนทนาละครเรื่อง {title_clean}")
-        if known_chars:
-            chars_str = ", ".join(known_chars[:15])
-            prompt_parts.append(f"ตัวละคร: {chars_str}")
+    if title_clean:
+        prompt_parts.append(f"บทสนทนาละครเรื่อง {title_clean}")
+    if known_chars:
+        chars_str = ", ".join(known_chars[:15])
+        prompt_parts.append(f"ตัวละคร: {chars_str}")
     if prompt and prompt.strip():
         p_str = prompt.strip()
         if p_str not in prompt_parts:
