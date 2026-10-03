@@ -8,6 +8,7 @@ import threading
 import subprocess
 import tempfile
 import logging
+import traceback
 from typing import Optional, List, Union, Dict
 from pydantic import BaseModel
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, BackgroundTasks
@@ -113,9 +114,11 @@ except Exception:
 
 TRANSCRIBE_LOG_PATH = "/root/whisper-server/transcribe.log"
 SERVER_LOG_PATH = "/root/whisper-server/server.log"
+FAILED_JOBS_LOG_PATH = "/root/whisper-server/failed_jobs.jsonl"
 
 import contextvars
 current_file_ctx = contextvars.ContextVar("current_file_ctx", default="")
+current_pipeline_stage = contextvars.ContextVar("current_pipeline_stage", default="Init")
 
 def log_transcribe(msg: str, filename: str = None):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -142,6 +145,78 @@ def log_transcribe(msg: str, filename: str = None):
             f.write(formatted)
     except Exception as ex:
         print(f"Log write error: {ex}", flush=True)
+
+def log_failed_job(
+    custom_id: Optional[str] = None,
+    filename: Optional[str] = None,
+    drama_title: Optional[str] = None,
+    stage: str = "Unknown",
+    error: Union[Exception, str] = "",
+    traceback_str: Optional[str] = None,
+    duration_sec: float = 0.0,
+    elapsed_sec: float = 0.0,
+    extra_params: Optional[dict] = None
+) -> dict:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    err_msg = str(error)
+    err_type = type(error).__name__ if isinstance(error, Exception) else "Error"
+    if not traceback_str and isinstance(error, Exception):
+        traceback_str = traceback.format_exc()
+
+    # Capture GPU snapshot if available
+    gpu_info = {}
+    try:
+        cmd = ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        if res.returncode == 0 and res.stdout.strip():
+            parts = [p.strip() for p in res.stdout.strip().split(",")]
+            if len(parts) >= 4:
+                gpu_info = {
+                    "mem_used_mb": int(float(parts[0])),
+                    "mem_total_mb": int(float(parts[1])),
+                    "util_pct": int(float(parts[2])),
+                    "temp_c": int(float(parts[3]))
+                }
+    except Exception:
+        pass
+
+    record = {
+        "timestamp": ts,
+        "custom_id": custom_id or "",
+        "filename": filename or "",
+        "drama_title": drama_title or "",
+        "stage": stage,
+        "error_type": err_type,
+        "error_message": err_msg,
+        "traceback": traceback_str or "",
+        "duration_sec": round(duration_sec, 2),
+        "elapsed_sec": round(elapsed_sec, 2),
+        "gpu_snapshot": gpu_info,
+        "params": extra_params or {}
+    }
+
+    # Write to FAILED_JOBS_LOG_PATH (auto-rotate if > 10MB)
+    try:
+        target_path = FAILED_JOBS_LOG_PATH
+        d = os.path.dirname(target_path)
+        if d and not os.path.exists(d):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                target_path = "failed_jobs.jsonl"
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 10 * 1024 * 1024:
+            try:
+                os.replace(target_path, f"{target_path}.1")
+            except Exception:
+                pass
+        with open(target_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as ex:
+        print(f"Failed to write failed_jobs.jsonl: {ex}", flush=True)
+
+    # Also log human-readable summary line to transcribe.log
+    log_transcribe(f"[JOB FAILED] Stage: {stage} | File: {filename} ({custom_id}) | Error: {err_type}: {err_msg}", filename=filename)
+    return record
 
 # ==========================================
 # SPEAKER DIARIZATION (pyannote.audio)
@@ -779,15 +854,15 @@ def _run_local_ollama_refinement(
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
     ollama_url: str = "http://127.0.0.1:11434",
-    model: str = "qwen2.5:7b",
+    model: str = "qwen2.5:14b",
     batch_size: int = 25
 ) -> tuple:
     """
-    Executes local Qwen2.5-7B contextual proofreading via Ollama.
+    Executes local Qwen2.5-14B contextual proofreading via Ollama.
     Returns (refined_segments, total_corrected, duration_sec).
     """
     t_llm_start = time.time()
-    log_transcribe(f"[STEP 6 LOCAL LLM] Starting local Qwen2.5-7B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
+    log_transcribe(f"[STEP 6 LOCAL LLM] Starting local Qwen2.5-14B contextual refinement for {len(segments)} cues (drama: {drama_title or 'ทั่วไป'})...")
 
     char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
     system_prompt = (
@@ -796,12 +871,11 @@ def _run_local_ollama_refinement(
         f"ข้อมูลละคร: เรื่อง '{drama_title or 'ทั่วไป'}'\n"
         f"รายชื่อตัวละครหลัก: {char_str}\n\n"
         "กฎเหล็กในการตรวจแก้:\n"
-        "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก เช่น หากได้ยินชื่อเพี้ยนหรือพ้องเสียงใกล้เคียง (เช่น พี่ดนทร์/พี่ผู้ชม/พี่โดน -> พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี -> เนตรศิริ) ให้แก้เป็นชื่อตัวละครที่ถูกต้องตามบริบท\n"
-        "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น:\n"
-        "   - เสียงพยัญชนะ/สระเพี้ยน: 'เต้นความ' -> 'แจ้งความ', 'จุดรวช' -> 'ตำรวจ', 'พลิกแฟร์ม' -> 'พลิกแฟ้ม'\n"
-        "   - คำไม่มีความหมายหรือผิดไวยากรณ์: 'โมโมง/มองหมอก' -> 'หมองมัว', 'สาปศูนย์' -> 'สาบสูญ'\n"
+        "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก (เช่น หากได้ยิน พี่ดนทร์/พี่ผู้ชม ให้แก้เป็น พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี ให้แก้เป็น เนตรศิริ ตามบริบทละคร)\n"
+        "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น 'เต้นความ' แก้เป็น 'แจ้งความ', 'จุดรวช' แก้เป็น 'ตำรวจ', 'พลิกแฟร์ม' แก้เป็น 'พลิกแฟ้ม', 'โมโมง' แก้เป็น 'หมองมัว', 'สาปศูนย์' แก้เป็น 'สาบสูญ'\n"
         "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
-        "4. ส่งผลลัพธ์กลับมาเป็น JSON Object ตาม ID เดิมเป๊ะ ในรูปแบบ {{\"ID\": \"ข้อความ\"}}"
+        "4. ข้อห้ามเรื่องรูปแบบ: ให้ส่งเฉพาะประโยคหรือข้อความที่แก้ไขสมบูรณ์แล้วเท่านั้น ห้ามใส่เครื่องหมายลูกศร (-> หรือ →) หรือข้อความเปรียบเทียบเดิมเด็ดขาด เช่น ให้ส่ง 'ตำรวจ' ห้ามส่ง 'จุดรวช -> ตำรวจ'\n"
+        "5. กฎสำคัญด้านความเร็ว (Diff-Only): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {{\"2\": \"ข้อความที่แก้แล้ว\"}} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {{}}"
     )
 
     refined_segments = [dict(s) for s in segments]
@@ -818,11 +892,11 @@ def _run_local_ollama_refinement(
                 "stream": False,
                 "options": {
                     "temperature": 0.1,
-                    "num_predict": 2048
+                    "num_predict": 1024
                 },
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้:\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
+                    {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้ และส่งคืนเฉพาะ ID ที่มีคำผิด (หากไม่มีคำผิดให้ส่ง {{}}):\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
                 ]
             }, ensure_ascii=False).encode("utf-8")
 
@@ -849,6 +923,10 @@ def _run_local_ollama_refinement(
                         sid = str(s["id"])
                         if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
                             new_text = corr_map[sid].strip()
+                            if "->" in new_text or "→" in new_text:
+                                parts = re.split(r'\s*(?:->|→)\s*', new_text)
+                                new_text = parts[-1].strip()
+                            new_text = re.sub(r'^[\'"]|[\'"]$', '', new_text).strip()
                             if new_text != s["text"]:
                                 s["text"] = new_text
                                 total_corrected += 1
@@ -859,14 +937,14 @@ def _run_local_ollama_refinement(
             continue
 
     llm_dur = round(time.time() - t_llm_start, 2)
-    log_transcribe(f"[STEP 6 LOCAL LLM COMPLETED] Qwen2.5-7B refined {total_corrected} cues successfully in {llm_dur}s (Timestamps 100% preserved).")
+    log_transcribe(f"[STEP 6 LOCAL LLM COMPLETED] Qwen2.5-14B refined {total_corrected} cues successfully in {llm_dur}s (Timestamps 100% preserved).")
     return refined_segments, total_corrected, llm_dur
 
 def _run_remote_master_llm_refinement(
     segments: list,
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
-    model: str = "qwen2.5:7b",
+    model: str = "qwen2.5:14b",
     batch_size: int = 25
 ) -> list:
     """
@@ -924,7 +1002,7 @@ def refine_subtitles_with_llm(
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
     ollama_url: str = "http://127.0.0.1:11434",
-    model: str = "qwen2.5:7b",
+    model: str = "qwen2.5:14b",
     batch_size: int = 25
 ) -> list:
     """
@@ -1395,9 +1473,11 @@ def transcribe_hybrid_thai(
     Step 6: Fast Local LLM Contextual Refinement (Qwen2.5-7B via Ollama)
     Fallback: If CTC alignment fails for a segment, use large-v3 word timestamps instead
     """
+    current_pipeline_stage.set("Step 0: Audio Read & Normalization")
     wav, sr = sf.read(audio_path, dtype="float32")
     if isolate_vocals and demucs_model is not None:
         try:
+            current_pipeline_stage.set("Step 0: HDemucs Vocal Isolation")
             log_transcribe(f"[VOCAL ISOLATION] Running HDemucs v4 vocal isolation...")
             t_vocals = isolate_vocals_from_audio(wav, sr)
             wav = t_vocals.cpu().numpy()
@@ -1437,6 +1517,7 @@ def transcribe_hybrid_thai(
             initial_prompt = clean_user_prompt
 
     # ===== STEP 1: Turbo transcription (full coverage) =====
+    current_pipeline_stage.set("Step 1: Faster-Whisper Base Transcription")
     segments_gen, info = turbo_model.transcribe(
         wav,
         language="th",
@@ -1461,6 +1542,7 @@ def transcribe_hybrid_thai(
     all_words = []
     ctc_aligned_count = 0
     turbo_fallback_count = 0
+    current_pipeline_stage.set("Step 2: Typhoon CTC Forced Alignment")
 
     for seg in turbo_segments:
         seg_text = seg.text.strip()
@@ -1673,6 +1755,48 @@ async def touch_keep_alive():
 
 @app.get("/logs")
 def get_logs(lines: int = 60, mode: str = "transcribe"):
+    if mode == "failed":
+        target_path = FAILED_JOBS_LOG_PATH
+        if not os.path.exists(target_path):
+            if os.path.exists("failed_jobs.jsonl"):
+                target_path = "failed_jobs.jsonl"
+            else:
+                return {
+                    "logs": [
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [OK] ไม่พบประวัติงานที่ล้มเหลว (All GPU jobs executed successfully)"
+                    ],
+                    "failed_jobs": [],
+                    "total_failed": 0,
+                    "server_time": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+        try:
+            cmd = ["tail", "-n", str(min(500, max(5, lines))), target_path]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            raw_lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            parsed_records = []
+            formatted_logs = []
+            for rl in raw_lines:
+                try:
+                    obj = json.loads(rl)
+                    parsed_records.append(obj)
+                    ts = obj.get("timestamp", "")
+                    fn = obj.get("filename", "")
+                    cid = obj.get("custom_id", "")
+                    stg = obj.get("stage", "Unknown")
+                    etype = obj.get("error_type", "Error")
+                    emsg = obj.get("error_message", "")
+                    formatted_logs.append(f"[{ts}] [FAILED] [{stg}] {fn} ({cid}) - {etype}: {emsg}")
+                except Exception:
+                    formatted_logs.append(rl)
+            return {
+                "logs": formatted_logs,
+                "failed_jobs": parsed_records,
+                "total_failed": len(parsed_records),
+                "server_time": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        except Exception as e:
+            return {"logs": [f"Error reading failed logs: {e}"], "failed_jobs": [], "total_failed": 0}
+
     target_path = TRANSCRIBE_LOG_PATH if mode == "transcribe" else SERVER_LOG_PATH
     if not os.path.exists(target_path):
         return {
@@ -1695,6 +1819,10 @@ def get_logs(lines: int = 60, mode: str = "transcribe"):
         }
     except Exception as e:
         return {"logs": [f"Error reading logs: {e}"]}
+
+@app.get("/v1/jobs/failed")
+def get_failed_jobs(limit: int = 50):
+    return get_logs(lines=limit, mode="failed")
 
 @app.get("/gpu")
 def get_gpu_stats():
@@ -1997,17 +2125,35 @@ def async_webhook_worker(
             }
             send_webhook_callback(webhook_url, payload)
     except Exception as e:
-        log_transcribe(f"[ASYNC WORKER ERROR] {e}")
+        infer_sec = round(time.time() - start_ts, 2)
+        tb_str = traceback.format_exc()
+        stage_name = current_pipeline_stage.get()
+        log_failed_job(
+            custom_id=custom_id or orig_filename,
+            filename=orig_filename,
+            drama_title=drama_title,
+            stage=stage_name,
+            error=e,
+            traceback_str=tb_str,
+            duration_sec=0.0,
+            elapsed_sec=infer_sec,
+            extra_params={"model": model_name, "language": language, "isolate_vocals": isolate_vocals, "sync": False}
+        )
         try:
             err_payload = {
                 "status": "failed",
                 "custom_id": custom_id,
                 "token": webhook_secret,
-                "error": str(e)
+                "filename": orig_filename,
+                "stage": stage_name,
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "traceback": tb_str[-800:] if tb_str else "",
+                "elapsed_sec": infer_sec
             }
             send_webhook_callback(webhook_url, err_payload, retries=1)
-        except:
-            pass
+        except Exception as _cb_ex:
+            log_transcribe(f"[WEBHOOK FAILED CALLBACK ERROR] {_cb_ex}")
     finally:
         with state_lock:
             active_jobs = max(0, active_jobs - 1)
@@ -2052,7 +2198,7 @@ class RefineSubtitlesRequest(BaseModel):
     segments: List[dict]
     drama_title: Optional[str] = None
     known_chars: Optional[List[str]] = None
-    model: Optional[str] = "qwen2.5:7b"
+    model: Optional[str] = "qwen2.5:14b"
     batch_size: Optional[int] = 25
 
 @app.post("/v1/llm/refine")
@@ -2074,7 +2220,7 @@ def api_llm_refine(req: RefineSubtitlesRequest):
         segments=req.segments,
         drama_title=req.drama_title,
         known_chars=req.known_chars,
-        model=req.model or "qwen2.5:7b",
+        model=req.model or "qwen2.5:14b",
         batch_size=req.batch_size or 25
     )
     return {
@@ -2208,6 +2354,19 @@ def transcribe(
         )
     except Exception as e:
         infer_sec = round(time.time() - start_ts, 2)
+        tb_str = traceback.format_exc()
+        stage_name = current_pipeline_stage.get()
+        log_failed_job(
+            custom_id=custom_id or orig_filename,
+            filename=orig_filename,
+            drama_title=title_clean,
+            stage=stage_name,
+            error=e,
+            traceback_str=tb_str,
+            duration_sec=0.0,
+            elapsed_sec=infer_sec,
+            extra_params={"model": model_name, "language": language, "isolate_vocals": isolate_vocals, "sync": True}
+        )
         log_transcribe(f"[ERROR] ถอดเสียงล้มเหลว ({infer_sec}s): {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
