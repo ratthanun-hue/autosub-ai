@@ -1547,7 +1547,7 @@ def safe_transcribe_segments(model, wav, **transcribe_kwargs):
     segments_gen, info = model.transcribe(wav, **fallback_kwargs)
     return list(segments_gen), info
 
-def transcribe_with_turbo_thai(
+def transcribe_with_large_v3_thai(
     audio_path: str,
     initial_prompt: Optional[str] = None,
     max_chars_per_cue: int = 70,
@@ -1558,10 +1558,10 @@ def transcribe_with_turbo_thai(
     isolate_vocals: bool = True,
 ):
     """
-    End-to-End Thai Transcription & Alignment via Whisper large-v3-turbo:
+    End-to-End Thai Transcription & Alignment via Whisper large-v3 (32-Decoder Layers):
     1. Vocal Isolation (HDemucs) -> optional BGM removal
     2. Dynamic RMS Normalization -> safely boosts soft speech & whispers
-    3. Large-v3-turbo Transformer Decoder -> context-aware, zero dropped sentences
+    3. Whisper large-v3 Transformer Decoder -> context-aware, zero dropped sentences
     4. Word-level Timestamps -> accurate alignment
     5. PyThaiNLP Tokenization -> natural Thai word boundaries
     6. Dialogue Segmentation -> ENDING_PARTICLES split, pause >= 0.08s, max 70 chars
@@ -1609,7 +1609,7 @@ def transcribe_with_turbo_thai(
 
     with WHISPER_SEMAPHORE:
         raw_segments, info = safe_transcribe_segments(
-            turbo_model,
+            whisper_model,
             wav,
             language="th",
             temperature=temperature,
@@ -1687,6 +1687,8 @@ def transcribe_with_turbo_thai(
     full_text = " ".join(s["text"] for s in segments)
     return segments, full_text, total_duration
 
+transcribe_with_turbo_thai = transcribe_with_large_v3_thai  # Backward-compatibility alias
+
 def transcribe_hybrid_thai(
     audio_path: str,
     initial_prompt: Optional[str] = None,
@@ -1751,11 +1753,11 @@ def transcribe_hybrid_thai(
         else:
             initial_prompt = clean_user_prompt
 
-    # ===== STEP 1: Turbo transcription (full coverage) =====
+    # ===== STEP 1: Whisper large-v3 Base Transcription (full coverage) =====
     current_pipeline_stage.set("Step 1: Faster-Whisper Base Transcription")
     with WHISPER_SEMAPHORE:
-        turbo_segments, info = safe_transcribe_segments(
-            turbo_model,
+        base_segments, info = safe_transcribe_segments(
+            whisper_model,
             wav,
             language="th",
             temperature=temperature,
@@ -1770,17 +1772,17 @@ def transcribe_hybrid_thai(
             vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
         )
 
-    log_transcribe(f"[HYBRID] Step 1 done: large-v3 produced {len(turbo_segments)} raw segments")
+    log_transcribe(f"[HYBRID] Step 1 done: large-v3 produced {len(base_segments)} raw segments")
 
     # Convert wav to torch tensor for CTC alignment
     x_16k = torch.as_tensor(wav, dtype=torch.float32)
 
     all_words = []
     ctc_aligned_count = 0
-    turbo_fallback_count = 0
+    whisper_fallback_count = 0
     current_pipeline_stage.set("Step 2: Typhoon CTC Forced Alignment")
 
-    for seg in turbo_segments:
+    for seg in base_segments:
         seg_text = seg.text.strip()
         if not seg_text:
             continue
@@ -1797,7 +1799,7 @@ def transcribe_hybrid_thai(
             seg_audio = x_16k[start_sample:end_sample]
 
             if len(seg_audio) / 16000.0 >= 0.3:
-                # Build CTC target from Turbo's transcription
+                # Build CTC target from Whisper large-v3 transcription
                 target_ids = []
                 chars = []
                 for ch in seg_text:
@@ -1877,10 +1879,10 @@ def transcribe_hybrid_thai(
             # CTC alignment failed for this segment, will fallback below
             pass
 
-        # ===== FALLBACK: Use Turbo word timestamps if CTC failed =====
+        # ===== FALLBACK: Use Whisper large-v3 word timestamps if CTC failed =====
         if not ctc_success:
-            turbo_fallback_count += 1
-            # Use Turbo's own word-level timestamps with PyThaiNLP tokenization
+            whisper_fallback_count += 1
+            # Use Whisper large-v3's own word-level timestamps with PyThaiNLP tokenization
             char_spans = []
             if seg.words:
                 for w in seg.words:
@@ -1933,7 +1935,7 @@ def transcribe_hybrid_thai(
                     })
                     idx += len(tw)
 
-    log_transcribe(f"[HYBRID] Step 2 done: CTC aligned {ctc_aligned_count} segments, large-v3 fallback {turbo_fallback_count} segments")
+    log_transcribe(f"[HYBRID] Step 2 done: CTC aligned {ctc_aligned_count} segments, large-v3 fallback {whisper_fallback_count} segments")
     log_transcribe(f"[HYBRID] Step 3 done: PyThaiNLP word grouping with Drama Trie ({len(all_words)} words)")
 
     segments = form_dialogue_segments(all_words, max_chars_per_cue, max_pause_sec, min_cue_dur, time_offset=time_offset)
@@ -1949,8 +1951,8 @@ def transcribe_multilingual(
     time_offset: float = 0.0,
     isolate_vocals: bool = False
 ) -> Tuple[List[Dict[str, Any]], str, float]:
-    global turbo_model
-    if turbo_model is None:
+    global whisper_model
+    if whisper_model is None:
         load_models()
 
     current_pipeline_stage.set("Step 0: Audio Read & Normalization")
@@ -1988,7 +1990,7 @@ def transcribe_multilingual(
 
     with WHISPER_SEMAPHORE:
         raw_segments, info = safe_transcribe_segments(
-            turbo_model,
+            whisper_model,
             wav,
             language=target_lang,
             temperature=temperature,
@@ -2259,11 +2261,11 @@ def do_transcription_pipeline(
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals, time_offset=offset_val)
         detected_lang = "th"
-    elif req_model == "turbo" or req_model == "large-v3-thai":
+    elif req_model in ["large-v3", "large-v3-thai", "turbo"]:
         engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
-        segments, combined_text, audio_dur = transcribe_with_turbo_thai(
+        segments, combined_text, audio_dur = transcribe_with_large_v3_thai(
             tmp_path,
             initial_prompt=initial_prompt,
             temperature=temperature,
