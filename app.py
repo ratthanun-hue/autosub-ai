@@ -1519,6 +1519,34 @@ def transcribe_with_typhoon(audio_path: str, max_chars_per_cue: int = 70, max_pa
     full_text = " ".join(s["text"] for s in segments)
     return segments, full_text, total_duration
 
+def safe_transcribe_segments(model, wav, **transcribe_kwargs):
+    """
+    Robust faster-whisper generator consumer with multi-tier fallback.
+    Prevents crash from faster-whisper DTW alignment bugs:
+    'IndexError: boolean index did not match indexed array along axis 0; size of axis is 0 but size of corresponding boolean axis is 1'
+    """
+    # Tier 1: As requested (with word_timestamps if specified)
+    try:
+        segments_gen, info = model.transcribe(wav, **transcribe_kwargs)
+        return list(segments_gen), info
+    except (IndexError, Exception) as err:
+        log_transcribe(f"[WHISPER-RETRY] Primary transcribe failed ({type(err).__name__}: {err}). Retrying with word_timestamps=False...")
+
+    # Tier 2: Disable word_timestamps (bypasses DTW find_alignment bug)
+    fallback_kwargs = dict(transcribe_kwargs)
+    fallback_kwargs["word_timestamps"] = False
+    try:
+        segments_gen, info = model.transcribe(wav, **fallback_kwargs)
+        return list(segments_gen), info
+    except Exception as err2:
+        log_transcribe(f"[WHISPER-RETRY] Secondary transcribe failed ({err2}). Retrying with vad_filter=False...")
+
+    # Tier 3: Disable VAD filter as ultimate baseline fallback
+    fallback_kwargs["vad_filter"] = False
+    fallback_kwargs.pop("vad_parameters", None)
+    segments_gen, info = model.transcribe(wav, **fallback_kwargs)
+    return list(segments_gen), info
+
 def transcribe_with_turbo_thai(
     audio_path: str,
     initial_prompt: Optional[str] = None,
@@ -1580,7 +1608,8 @@ def transcribe_with_turbo_thai(
             initial_prompt = clean_user_prompt
 
     with WHISPER_SEMAPHORE:
-        segments_gen, info = turbo_model.transcribe(
+        raw_segments, info = safe_transcribe_segments(
+            turbo_model,
             wav,
             language="th",
             temperature=temperature,
@@ -1594,7 +1623,6 @@ def transcribe_with_turbo_thai(
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
         )
-        raw_segments = list(segments_gen)
 
     all_words = []
     for s in raw_segments:
@@ -1726,7 +1754,8 @@ def transcribe_hybrid_thai(
     # ===== STEP 1: Turbo transcription (full coverage) =====
     current_pipeline_stage.set("Step 1: Faster-Whisper Base Transcription")
     with WHISPER_SEMAPHORE:
-        segments_gen, info = turbo_model.transcribe(
+        turbo_segments, info = safe_transcribe_segments(
+            turbo_model,
             wav,
             language="th",
             temperature=temperature,
@@ -1740,7 +1769,6 @@ def transcribe_hybrid_thai(
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
         )
-        turbo_segments = list(segments_gen)
 
     log_transcribe(f"[HYBRID] Step 1 done: large-v3 produced {len(turbo_segments)} raw segments")
 
@@ -1959,7 +1987,8 @@ def transcribe_multilingual(
     current_pipeline_stage.set(f"Faster-Whisper ({target_lang})")
 
     with WHISPER_SEMAPHORE:
-        segments_gen, info = turbo_model.transcribe(
+        raw_segments, info = safe_transcribe_segments(
+            turbo_model,
             wav,
             language=target_lang,
             temperature=temperature,
@@ -1973,7 +2002,6 @@ def transcribe_multilingual(
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
         )
-        raw_segments = list(segments_gen)
 
     segments = []
     seg_idx = 1
