@@ -34,6 +34,7 @@ WORKDIR /root/whisper-server
 
 COPY llm_server.py .
 COPY self_register_master.py .
+COPY port_bridge.py .
 COPY entrypoint_master.sh /usr/local/bin/entrypoint_master.sh
 
 RUN chmod +x /usr/local/bin/entrypoint_master.sh && \

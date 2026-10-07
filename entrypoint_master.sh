@@ -48,6 +48,12 @@ if [ -f "/root/whisper-server/self_register_master.py" ]; then
     nohup $PYTHON_BIN /root/whisper-server/self_register_master.py > /root/whisper-server/self_register_master.log 2>&1 &
 fi
 
+# 6.5 รัน Port Bridge (10100 -> 10200) เพื่อให้ปุ่มเปิดของ Vast.ai console ใช้งานได้
+if [ -f "/root/whisper-server/port_bridge.py" ]; then
+    echo "Starting Port Bridge on 10100 -> 10200..."
+    nohup $PYTHON_BIN /root/whisper-server/port_bridge.py > /root/whisper-server/port_bridge.log 2>&1 &
+fi
+
 # 7. เริ่มต้น FastAPI / Uvicorn Server บนพอร์ต 10200
 UVICORN_BIN=$(which uvicorn || echo "$PYTHON_BIN -m uvicorn")
 echo "=========================================================="
