@@ -21,7 +21,7 @@ import urllib.error
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
 # Logging setup
@@ -123,6 +123,262 @@ def warmup_model():
 def startup_event():
     t = threading.Thread(target=warmup_model, daemon=True)
     t.start()
+
+@app.get("/", response_class=HTMLResponse)
+def index_dashboard():
+    html_content = """<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoSub-AI Central Master LLM Node</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=Noto+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0e17;
+            --card-bg: rgba(18, 26, 43, 0.75);
+            --border-glow: rgba(56, 189, 248, 0.2);
+            --primary: #38bdf8;
+            --primary-glow: rgba(56, 189, 248, 0.4);
+            --accent: #818cf8;
+            --success: #34d399;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Plus Jakarta Sans', 'Noto Sans Thai', sans-serif;
+            background: radial-gradient(circle at 50% 0%, #1e293b 0%, #0a0e17 70%);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 30px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container { width: 100%; max-width: 900px; }
+        header { text-align: center; margin-bottom: 30px; }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 16px;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 700;
+            background: rgba(52, 211, 153, 0.15);
+            border: 1px solid rgba(52, 211, 153, 0.4);
+            color: var(--success);
+            margin-bottom: 15px;
+        }
+        .dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 10px var(--success); }
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #fff 0%, #94a3b8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+        p.subtitle { color: var(--text-muted); font-size: 0.95rem; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-glow);
+            border-radius: 16px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+        .card:hover {
+            border-color: var(--primary);
+            box-shadow: 0 8px 24px var(--primary-glow);
+            transform: translateY(-2px);
+        }
+        .card-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+        .card-val { font-size: 1.3rem; font-weight: 700; color: #fff; }
+        .card-val.green { color: var(--success); }
+        .card-val.blue { color: var(--primary); }
+        .main-panel {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-glow);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 25px;
+        }
+        h2 { font-size: 1.25rem; font-weight: 700; margin-bottom: 15px; color: var(--primary); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 6px; font-weight: 600; }
+        input, textarea {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            border-radius: 10px;
+            padding: 10px 14px;
+            color: #fff;
+            font-size: 0.95rem;
+            font-family: inherit;
+            outline: none;
+            transition: border 0.2s;
+        }
+        input:focus, textarea:focus { border-color: var(--primary); }
+        textarea { resize: vertical; min-height: 80px; }
+        .btn {
+            background: linear-gradient(135deg, #0284c7 0%, #2563eb 100%);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            padding: 12px 24px;
+            font-size: 0.95rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn:hover {
+            box-shadow: 0 0 20px var(--primary-glow);
+            transform: scale(1.02);
+        }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            color: var(--text-main);
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: 0.2s;
+        }
+        .btn-outline:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        .links-bar {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-top: 20px;
+        }
+        #resultBox {
+            margin-top: 15px;
+            background: rgba(10, 14, 23, 0.8);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            border-radius: 10px;
+            padding: 15px;
+            font-family: monospace;
+            font-size: 0.9rem;
+            white-space: pre-wrap;
+            display: none;
+            color: #38bdf8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="badge"><div class="dot"></div> MASTER LLM ACTIVE (JAPAN DC 🇯🇵)</div>
+            <h1>Central Master LLM Node</h1>
+            <p class="subtitle">AutoSub-AI Step 6 Contextual Proofreading & Translation Cluster Service</p>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">AI Model</div>
+                <div class="card-val blue" id="valModel">Qwen2.5-14B</div>
+            </div>
+            <div class="card">
+                <div class="card-label">GPU Hardware</div>
+                <div class="card-val" id="valGPU">RTX A4000 16GB</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Ollama Engine</div>
+                <div class="card-val green" id="valOllama">CONNECTED</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Active / Completed</div>
+                <div class="card-val" id="valJobs">0 / 0</div>
+            </div>
+        </div>
+
+        <div class="main-panel">
+            <h2>🧪 ทดสอบ Contextual Proofreading (Step 6)</h2>
+            <div class="form-group">
+                <label>ชื่อเรื่อง / ซีรีส์ (Drama Title)</label>
+                <input type="text" id="dramaTitle" value="พรหมลิขิต" placeholder="เช่น พรหมลิขิต, บุพเพสันนิวาส">
+            </div>
+            <div class="form-group">
+                <label>ข้อความซับไตเติลภาษาไทยที่ต้องการตรวจแก้ (Subtitle Text)</label>
+                <textarea id="subText">สวัสดีเจ้าค่ะ แม่นาย</textarea>
+            </div>
+            <button class="btn" onclick="runProofread()">⚡ สั่ง Refine ผ่าน Qwen2.5-14B</button>
+            <div id="resultBox"></div>
+        </div>
+
+        <div class="links-bar">
+            <a class="btn-outline" href="/docs" target="_blank">📖 Swagger API Docs (/docs)</a>
+            <a class="btn-outline" href="/health" target="_blank">🩺 Health Check JSON</a>
+            <a class="btn-outline" href="/gpu" target="_blank">⚡ GPU Status JSON</a>
+            <a class="btn-outline" href="/logs" target="_blank">📋 Server Logs</a>
+        </div>
+    </div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/health');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('valModel').innerText = data.model || 'Qwen2.5-14B';
+                    document.getElementById('valGPU').innerText = data.gpu || 'RTX A4000 16GB';
+                    document.getElementById('valOllama').innerText = data.ollama_connected ? 'CONNECTED' : 'DISCONNECTED';
+                    document.getElementById('valJobs').innerText = `${data.active_jobs || 0} / ${data.jobs_completed || 0}`;
+                }
+            } catch(e) {}
+        }
+        fetchStats();
+        setInterval(fetchStats, 5000);
+
+        async function runProofread() {
+            const title = document.getElementById('dramaTitle').value.trim();
+            const text = document.getElementById('subText').value.trim();
+            const box = document.getElementById('resultBox');
+            box.style.display = 'block';
+            box.innerText = '⏳ กำลังประมวลผลผ่าน Qwen2.5-14B...';
+            try {
+                const t0 = performance.now();
+                const res = await fetch('/v1/llm/refine', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        drama_title: title,
+                        segments: [{ id: 1, start: 0.0, end: 2.0, text: text }]
+                    })
+                });
+                const t1 = performance.now();
+                const data = await res.json();
+                box.innerText = `⏱️ ใช้เวลา: ${((t1 - t0) / 1000).toFixed(2)} วินาที\\n\\n` + JSON.stringify(data, null, 2);
+            } catch (err) {
+                box.innerText = '❌ เกิดข้อผิดพลาด: ' + err;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
 
 @app.get("/health")
 def health_check():
