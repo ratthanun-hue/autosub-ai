@@ -1,0 +1,85 @@
+name: Build and Push AutoSub Dual Docker Images
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # ========================================================
+  # 1. Build Dynamic Audio Worker (Steps 0-5)
+  # ========================================================
+  build-worker:
+    name: Build & Push Dynamic Worker (Steps 0-5)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Lowercase repository owner
+        run: echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Dynamic Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.dynamic
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/autosub-worker:latest
+            ghcr.io/${{ env.OWNER_LC }}/autosub-worker:${{ github.sha }}
+
+  # ========================================================
+  # 2. Build Central Master LLM (Step 6 Qwen2.5-14B)
+  # ========================================================
+  build-master:
+    name: Build & Push Master LLM (Step 6)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Lowercase repository owner
+        run: echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Master LLM
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.master
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/autosub-master:latest
+            ghcr.io/${{ env.OWNER_LC }}/autosub-master:${{ github.sha }}

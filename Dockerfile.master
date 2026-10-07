@@ -1,0 +1,43 @@
+# Master LLM Node Dockerfile (Ollama + Qwen2.5-14B + FastAPI Master Server)
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0
+
+# ติดตั้ง System Packages, Python3, Pip, และ Curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    python3-dev \
+    git \
+    pciutils \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ติดตั้ง Ollama Binary อย่างเป็นทางการ
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+# ติดตั้งแพ็กเกจ Python สำหรับ Master LLM Server
+RUN pip3 install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    pydantic \
+    requests
+
+# จัดการพื้นที่ทำงานและคัดลอกไฟล์ Server
+WORKDIR /root/whisper-server
+
+COPY llm_server.py .
+COPY self_register_master.py .
+COPY entrypoint_master.sh /usr/local/bin/entrypoint_master.sh
+
+RUN chmod +x /usr/local/bin/entrypoint_master.sh && \
+    ln -s /usr/local/bin/entrypoint_master.sh /entrypoint.sh
+
+# พอร์ต 10200 = Master LLM FastAPI, 11434 = Ollama (Local/Internal), 22 = SSH
+EXPOSE 10200 11434 22
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_master.sh"]

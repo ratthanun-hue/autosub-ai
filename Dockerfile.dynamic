@@ -1,0 +1,44 @@
+# Dynamic Audio Worker Node Dockerfile (Steps 0-5 Pipeline: Whisper + Typhoon CTC + HDemucs)
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0
+
+# ติดตั้ง System Packages, FFmpeg, และ aria2 สำหรับดาวน์โหลดความเร็วสูง
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    aria2 \
+    zstd \
+    git \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ติดตั้งแพ็กเกจสำหรับถอดเสียงภาษาไทยและ Audio Processing Pipeline
+RUN pip install --no-cache-dir \
+    faster-whisper \
+    transformers \
+    pythainlp \
+    torchaudio \
+    demucs \
+    fastapi \
+    uvicorn \
+    python-multipart \
+    soundfile
+
+# คัดลอกโค้ดสคริปต์, พจนานุกรม และสคริปต์ลงทะเบียนอัตโนมัติ
+WORKDIR /root/whisper-server
+COPY app.py .
+COPY thai_corrections.json .
+COPY thai_slang_words.json .
+COPY drama_character_knowledge.json .
+COPY self_register.py .
+COPY entrypoint_dynamic.sh /usr/local/bin/entrypoint_dynamic.sh
+
+RUN chmod +x /usr/local/bin/entrypoint_dynamic.sh && \
+    ln -s /usr/local/bin/entrypoint_dynamic.sh /entrypoint.sh
+
+EXPOSE 10100 22
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_dynamic.sh"]
