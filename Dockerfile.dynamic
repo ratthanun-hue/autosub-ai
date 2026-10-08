@@ -37,7 +37,9 @@ COPY self_register.py .
 COPY entrypoint_dynamic.sh /usr/local/bin/entrypoint_dynamic.sh
 
 RUN chmod +x /usr/local/bin/entrypoint_dynamic.sh && \
-    ln -s /usr/local/bin/entrypoint_dynamic.sh /entrypoint.sh
+    ln -sf /usr/local/bin/entrypoint_dynamic.sh /usr/local/bin/entrypoint.sh && \
+    ln -sf /usr/local/bin/entrypoint_dynamic.sh /usr/bin/entrypoint.sh && \
+    ln -sf /usr/local/bin/entrypoint_dynamic.sh /entrypoint.sh
 
 EXPOSE 10100 22
 
