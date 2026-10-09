@@ -141,7 +141,7 @@ def send_registration():
             "ip": public_ip,
             "port": str(master_port),
             "id": str(inst_id),
-            "model": "qwen2.5:14b",
+            "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:14b-instruct-q8_0"),
             "token": MASTER_AUTH_TOKEN
         }
         post_data = urllib.parse.urlencode(payload).encode("utf-8")

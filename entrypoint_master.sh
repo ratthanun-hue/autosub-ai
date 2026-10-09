@@ -31,8 +31,8 @@ for i in {1..30}; do
     sleep 2
 done
 
-# 5. ตรวจสอบและดึงโมเดล Qwen2.5-14B
-MODEL_NAME="${OLLAMA_MODEL:-qwen2.5:14b}"
+# 5. ตรวจสอบและดึงโมเดล Qwen2.5-14B (Default เป็น Q8_0 High Precision)
+MODEL_NAME="${OLLAMA_MODEL:-qwen2.5:14b-instruct-q8_0}"
 if ! ollama list | grep -q "$MODEL_NAME"; then
     echo "Pulling $MODEL_NAME into Ollama (this will take 1-3 minutes on first boot)..."
     ollama pull "$MODEL_NAME"

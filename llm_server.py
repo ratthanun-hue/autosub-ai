@@ -18,7 +18,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -44,6 +44,34 @@ app = FastAPI(
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+DEFAULT_ENGINE = os.environ.get("LLM_ENGINE", "gemini").strip().lower()
+DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+DEFAULT_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+
+def resolve_gemini_api_key(req_key: Optional[str] = None) -> str:
+    if req_key and req_key.strip():
+        return req_key.strip()
+    if DEFAULT_GEMINI_API_KEY:
+        return DEFAULT_GEMINI_API_KEY
+    for p in ["/root/whisper-server/.env", "/root/.env", os.path.expanduser("~/.env"), ".env"]:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("GEMINI_API_KEY="):
+                            return line.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+    try:
+        req = urllib.request.Request("http://ph.cdnwatch.com/subtitle.php?action=get_cluster_config", headers={"User-Agent": "Master-LLM"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            cfg = json.loads(resp.read().decode("utf-8"))
+            if cfg.get("gemini_api_key"):
+                return cfg["gemini_api_key"].strip()
+    except Exception:
+        pass
+    return ""
 
 # Concurrency control: Allow concurrent batch refinements (Configurable via MAX_PARALLEL_BATCHES, default: 4)
 MAX_PARALLEL_BATCHES = int(os.environ.get("MAX_PARALLEL_BATCHES", "4"))
@@ -65,6 +93,9 @@ class RefineRequest(BaseModel):
     known_chars: Optional[List[str]] = None
     model: Optional[str] = DEFAULT_MODEL
     batch_size: Optional[int] = 25
+    engine: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
 
 class AsyncRefineRequest(BaseModel):
     segments: List[Dict[str, Any]]
@@ -72,6 +103,9 @@ class AsyncRefineRequest(BaseModel):
     known_chars: Optional[List[str]] = None
     model: Optional[str] = DEFAULT_MODEL
     batch_size: Optional[int] = 25
+    engine: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
     webhook_url: str
     webhook_secret: Optional[str] = None
     token: Optional[str] = None
@@ -450,6 +484,120 @@ def system_stop():
     logger.info("Received /v1/system/stop request.")
     return {"status": "success", "message": "Master LLM stop signal acknowledged"}
 
+def refine_subtitles_gemini(
+    segments: List[Dict[str, Any]],
+    drama_title: str = "ทั่วไป",
+    known_chars: Optional[List[str]] = None,
+    api_key: str = "",
+    model: str = "gemini-3.5-flash-lite",
+    batch_size: int = 35
+) -> Tuple[List[Dict[str, Any]], int, float, str]:
+    """
+    Contextual Thai subtitle refinement powered by Google Gemini Flash API.
+    Sends cues in batches (up to 35 cues each) with structured JSON diff return.
+    Returns (refined_segments, total_corrected, duration_sec, status_info).
+    Raises Exception if API call fails so caller can trigger seamless Ollama fallback.
+    """
+    t_start = time.time()
+    char_str = ", ".join(known_chars[:15]) if known_chars else "ไม่ระบุ"
+    system_prompt = (
+        f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
+        f"ภารกิจ: เกลาบริบทบทสนทนาและแก้ไขคำที่ระบบฟังเสียงพูด (ASR/Whisper) ฟังเพี้ยนหรือพ้องเสียง (Contextual Homophones)\n"
+        f"ข้อมูลละคร: เรื่อง '{drama_title}'\n"
+        f"รายชื่อตัวละครหลัก: {char_str}\n\n"
+        "กฎเหล็กในการตรวจแก้:\n"
+        "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลักอย่างแม่นยำ (เช่น พี่ดนทร์/พี่เจด/พี่เจศ ให้แก้เป็น พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี ให้แก้เป็น เนตรศิริ ตามบริบทละคร)\n"
+        "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น 'เต้นความ' -> 'แจ้งความ', 'จุดรวช' -> 'ตำรวจ', 'พลิกแฟร์ม' -> 'พลิกแฟ้ม', 'โมโมง' -> 'หมองมัว', 'สาปศูนย์' -> 'สาบสูญ'\n"
+        "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
+        "4. ข้อห้ามเรื่องรูปแบบ: ส่งเฉพาะประโยคหรือข้อความที่แก้ไขสมบูรณ์แล้วเท่านั้น ห้ามใส่เครื่องหมายลูกศร (-> หรือ →) หรือข้อความเปรียบเทียบเดิมเด็ดขาด\n"
+        "5. กฎสำคัญด้านรูปแบบ (Diff-Only JSON): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {\"2\": \"ข้อความที่แก้แล้ว\"} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {}"
+    )
+
+    refined_segments = [dict(s) for s in segments]
+    total_corrected = 0
+
+    for i in range(0, len(refined_segments), batch_size):
+        chunk = refined_segments[i:i + batch_size]
+        cues_dict = {str(s.get("id", idx)): s.get("text", "") for idx, s in enumerate(chunk, start=i)}
+
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": f"จงตรวจแก้ซับไตเติลต่อไปนี้ และส่งคืนเฉพาะ ID ที่มีคำผิดในรูปแบบ JSON (หากไม่มีคำผิดให้ส่ง {{}}):\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json"
+            }
+        }
+
+        # Model trial order: requested model first, then gemini-3.5-flash-lite, then gemini-3.5-flash
+        models_to_try = [model]
+        for fallback_m in ["gemini-3.5-flash-lite", "gemini-3.5-flash"]:
+            if fallback_m not in models_to_try:
+                models_to_try.append(fallback_m)
+
+        resp_data = None
+        last_api_err = None
+        for cur_model in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{cur_model}:generateContent?key={api_key}"
+            req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=req_body,
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-GeminiEngine/1.0"}
+            )
+            for attempt in range(2):
+                try:
+                    with urllib.request.urlopen(req, timeout=30.0) as resp:
+                        resp_data = json.loads(resp.read().decode("utf-8"))
+                        break
+                except Exception as e:
+                    last_api_err = e
+                    if "429" in str(e) and attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    logger.warning(f"[GEMINI] Call with model {cur_model} failed (attempt {attempt+1}): {e}.")
+                    break
+            if resp_data:
+                break
+
+        if not resp_data:
+            raise last_api_err
+
+        content = resp_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
+        corr_map = {}
+        try:
+            corr_map = json.loads(content)
+        except Exception:
+            m = re.search(r'\{.*\}', content, re.DOTALL)
+            if m:
+                try:
+                    corr_map = json.loads(m.group(0))
+                except Exception:
+                    pass
+
+        if isinstance(corr_map, dict):
+            for idx, s in enumerate(chunk, start=i):
+                sid = str(s.get("id", idx))
+                if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
+                    new_text = corr_map[sid].strip()
+                    if "->" in new_text or "→" in new_text:
+                        parts = re.split(r'\s*(?:->|→)\s*', new_text)
+                        new_text = parts[-1].strip()
+                    new_text = re.sub(r'^[\'"]|[\'"]$', '', new_text).strip()
+                    if new_text and new_text != s.get("text", ""):
+                        s["text"] = new_text
+                        total_corrected += 1
+
+    dur = round(time.time() - t_start, 2)
+    return refined_segments, total_corrected, dur, "gemini_success"
+
 # ==============================================================================
 # 1. CONTEXTUAL THAI PROOFREADING (Step 6)
 # ==============================================================================
@@ -462,6 +610,35 @@ def refine_subtitles(req_data: RefineRequest):
 
     drama_title = req_data.drama_title or "ทั่วไป"
     known_chars = req_data.known_chars or []
+    engine = (req_data.engine or DEFAULT_ENGINE or "gemini").strip().lower()
+    gemini_key = resolve_gemini_api_key(req_data.gemini_api_key)
+    gemini_mod = req_data.gemini_model or DEFAULT_GEMINI_MODEL
+
+    # Route 1: Google Gemini Flash Engine (Pilot 1-Day Active)
+    if engine == "gemini" and gemini_key:
+        try:
+            logger.info(f"[GEMINI STEP 6] Refining {len(segments)} cues via {gemini_mod} for drama '{drama_title}'...")
+            ref_segs, corr_cnt, dur, _ = refine_subtitles_gemini(
+                segments=segments,
+                drama_title=drama_title,
+                known_chars=known_chars,
+                api_key=gemini_key,
+                model=gemini_mod
+            )
+            with total_completed_lock:
+                total_completed_jobs += 1
+            logger.info(f"[GEMINI SUCCESS] Refined {corr_cnt} cues in {dur}s (Engine: {gemini_mod}).")
+            return {
+                "status": "success",
+                "engine_used": gemini_mod,
+                "corrected_count": corr_cnt,
+                "segments": ref_segs,
+                "duration_sec": dur
+            }
+        except Exception as g_err:
+            logger.warning(f"[GEMINI NOTICE] Gemini call failed ({g_err}). Auto-Fallback to Local Ollama...")
+
+    # Route 2: Local Ollama (Qwen2.5-14B) - Default / Fallback
     model = req_data.model or DEFAULT_MODEL
     # Auto-upgrade to 14B on Master Node when 7b is requested by older workers
     if model in ("qwen2.5:7b", "qwen2.5", ""):
@@ -728,69 +905,96 @@ def _process_async_refine(job: AsyncRefineRequest):
         batch_size = max(10, min(job.batch_size or 25, 40))
 
         char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
-        system_prompt = (
-            f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
-            f"ภารกิจ: เกลาบริบทบทสนทนาและแก้ไขคำที่ระบบฟังเสียงพูด (ASR/Whisper) ฟังเพี้ยนหรือพ้องเสียง (Contextual Homophones)\n"
-            f"ข้อมูลละคร: เรื่อง '{drama_title}'\n"
-            f"รายชื่อตัวละครหลัก: {char_str}\n\n"
-            "กฎเหล็กในการตรวจแก้:\n"
-            "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก (เช่น หากได้ยิน พี่ดนทร์/พี่ผู้ชม ให้แก้เป็น พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี ให้แก้เป็น เนตรศิริ ตามบริบทละคร)\n"
-            "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น 'เต้นความ' แก้เป็น 'แจ้งความ', 'จุดรวช' แก้เป็น 'ตำรวจ', 'พลิกแฟร์ม' แก้เป็น 'พลิกแฟ้ม', 'โมโมง' แก้เป็น 'หมองมัว', 'สาปศูนย์' แก้เป็น 'สาบสูญ'\n"
-            "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
-            "4. ข้อห้ามเรื่องรูปแบบ: ให้ส่งเฉพาะประโยคหรือข้อความที่แก้ไขสมบูรณ์แล้วเท่านั้น ห้ามใส่เครื่องหมายลูกศร (-> หรือ →) หรือข้อความเปรียบเทียบเดิมเด็ดขาด เช่น ให้ส่ง 'ตำรวจ' ห้ามส่ง 'จุดรวช -> ตำรวจ'\n"
-            "5. กฎสำคัญด้านความเร็ว (Diff-Only): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {{\"2\": \"ข้อความที่แก้แล้ว\"}} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {{}}"
-        )
-
         total_corrected = 0
-        for i in range(0, len(segments), batch_size):
-            chunk = segments[i:i + batch_size]
-            cues_dict = {str(s.get("id", idx)): s.get("text", "") for idx, s in enumerate(chunk, start=i)}
 
+        engine = (job.engine or DEFAULT_ENGINE or "gemini").strip().lower()
+        gemini_key = resolve_gemini_api_key(job.gemini_api_key)
+        gemini_mod = job.gemini_model or DEFAULT_GEMINI_MODEL
+        gemini_success = False
+
+        # Route 1: Google Gemini Flash Engine (Pilot 1-Day Active)
+        if engine == "gemini" and gemini_key:
             try:
-                payload = {
-                    "model": model,
-                    "format": "json",
-                    "stream": False,
-                    "keep_alive": -1,
-                    "options": {"temperature": 0.1, "num_predict": 1024},
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้ และส่งคืนเฉพาะ ID ที่มีคำผิด (หากไม่มีคำผิดให้ส่ง {{}}):\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
-                    ]
-                }
-                req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(
-                    f"{OLLAMA_URL}/api/chat",
-                    data=req_body,
-                    headers={"Content-Type": "application/json; charset=utf-8"}
+                logger.info(f"[GEMINI ASYNC] Refining {len(segments)} cues via {gemini_mod} for '{custom_id}'...")
+                ref_segs, corr_cnt, g_dur, _ = refine_subtitles_gemini(
+                    segments=segments,
+                    drama_title=drama_title,
+                    known_chars=known_chars,
+                    api_key=gemini_key,
+                    model=gemini_mod
                 )
-                with urllib.request.urlopen(req, timeout=120.0) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    content = resp_json.get("message", {}).get("content", "").strip()
+                segments = ref_segs
+                total_corrected = corr_cnt
+                gemini_success = True
+                logger.info(f"[GEMINI ASYNC SUCCESS] Refined {corr_cnt} cues in {g_dur}s via {gemini_mod} for '{custom_id}'.")
+            except Exception as g_err:
+                logger.warning(f"[GEMINI ASYNC NOTICE] Gemini failed ({g_err}). Auto-Fallback to Local Ollama...")
 
-                    corr_map = {}
-                    try:
-                        corr_map = json.loads(content)
-                    except Exception:
-                        m = re.search(r'\{.*\}', content, re.DOTALL)
-                        if m:
-                            corr_map = json.loads(m.group(0))
+        # Route 2: Local Ollama (Qwen2.5-14B) - Fallback or when engine=ollama
+        if not gemini_success:
+            system_prompt = (
+                f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
+                f"ภารกิจ: เกลาบริบทบทสนทนาและแก้ไขคำที่ระบบฟังเสียงพูด (ASR/Whisper) ฟังเพี้ยนหรือพ้องเสียง (Contextual Homophones)\n"
+                f"ข้อมูลละคร: เรื่อง '{drama_title}'\n"
+                f"รายชื่อตัวละครหลัก: {char_str}\n\n"
+                "กฎเหล็กในการตรวจแก้:\n"
+                "1. แก้ไขชื่อตัวละครที่ฟังเพี้ยนให้ตรงกับรายชื่อตัวละครหลัก (เช่น หากได้ยิน พี่ดนทร์/พี่ผู้ชม ให้แก้เป็น พี่ดล หรือ คุณภูดล, นี้ซิริ/เนซีรี ให้แก้เป็น เนตรศิริ ตามบริบทละคร)\n"
+                "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น 'เต้นความ' แก้เป็น 'แจ้งความ', 'จุดรวช' แก้เป็น 'ตำรวจ', 'พลิกแฟร์ม' แก้เป็น 'พลิกแฟ้ม', 'โมโมง' แก้เป็น 'หมองมัว', 'สาปศูนย์' แก้เป็น 'สาบสูญ'\n"
+                "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
+                "4. ข้อห้ามเรื่องรูปแบบ: ให้ส่งเฉพาะประโยคหรือข้อความที่แก้ไขสมบูรณ์แล้วเท่านั้น ห้ามใส่เครื่องหมายลูกศร (-> หรือ →) หรือข้อความเปรียบเทียบเดิมเด็ดขาด เช่น ให้ส่ง 'ตำรวจ' ห้ามส่ง 'จุดรวช -> ตำรวจ'\n"
+                "5. กฎสำคัญด้านความเร็ว (Diff-Only): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {{\"2\": \"ข้อความที่แก้แล้ว\"}} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {{}}"
+            )
 
-                    if isinstance(corr_map, dict):
-                        for idx, s in enumerate(chunk, start=i):
-                            sid = str(s.get("id", idx))
-                            if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
-                                new_text = corr_map[sid].strip()
-                                if "->" in new_text or "→" in new_text:
-                                    parts = re.split(r'\s*(?:->|→)\s*', new_text)
-                                    new_text = parts[-1].strip()
-                                new_text = re.sub(r'^[\'"]|[\'"]$', '', new_text).strip()
-                                if new_text != s.get("text", ""):
-                                    s["text"] = new_text
-                                    total_corrected += 1
-            except Exception as b_err:
-                logger.warning(f"Batch {i // batch_size + 1} async refine warning: {b_err}. Keeping original cues.")
-                continue
+            total_corrected = 0
+            for i in range(0, len(segments), batch_size):
+                chunk = segments[i:i + batch_size]
+                cues_dict = {str(s.get("id", idx)): s.get("text", "") for idx, s in enumerate(chunk, start=i)}
+
+                try:
+                    payload = {
+                        "model": model,
+                        "format": "json",
+                        "stream": False,
+                        "keep_alive": -1,
+                        "options": {"temperature": 0.1, "num_predict": 1024},
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้ และส่งคืนเฉพาะ ID ที่มีคำผิด (หากไม่มีคำผิดให้ส่ง {{}}):\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
+                        ]
+                    }
+                    req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"{OLLAMA_URL}/api/chat",
+                        data=req_body,
+                        headers={"Content-Type": "application/json; charset=utf-8"}
+                    )
+                    with urllib.request.urlopen(req, timeout=120.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        content = resp_json.get("message", {}).get("content", "").strip()
+
+                        corr_map = {}
+                        try:
+                            corr_map = json.loads(content)
+                        except Exception:
+                            m = re.search(r'\{.*\}', content, re.DOTALL)
+                            if m:
+                                corr_map = json.loads(m.group(0))
+
+                        if isinstance(corr_map, dict):
+                            for idx, s in enumerate(chunk, start=i):
+                                sid = str(s.get("id", idx))
+                                if sid in corr_map and isinstance(corr_map[sid], str) and corr_map[sid].strip():
+                                    new_text = corr_map[sid].strip()
+                                    if "->" in new_text or "→" in new_text:
+                                        parts = re.split(r'\s*(?:->|→)\s*', new_text)
+                                        new_text = parts[-1].strip()
+                                    new_text = re.sub(r'^[\'"]|[\'"]$', '', new_text).strip()
+                                    if new_text != s.get("text", ""):
+                                        s["text"] = new_text
+                                        total_corrected += 1
+                except Exception as b_err:
+                    logger.warning(f"Batch {i // batch_size + 1} async refine warning: {b_err}. Keeping original cues.")
+                    continue
 
         dur = round(time.time() - t_start, 2)
         total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
