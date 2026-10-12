@@ -1,4 +1,4 @@
-# Master LLM Node Dockerfile (Ollama + Qwen2.5-14B + FastAPI Master Server)
+# Master LLM Node Dockerfile (Ollama + Qwen2.5-32B + FastAPI Master Server)
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive

@@ -4,15 +4,16 @@ set -e
 # 1. DNS Fix (ป้องกันปัญหา DNS resolution)
 echo -e 'nameserver 8.8.8.8\nnameserver 1.1.1.1' > /etc/resolv.conf 2>/dev/null || true
 
-# 2. ตั้งค่า Ollama Runtime เพื่อประสิทธิภาพสูงสุดบน 1x GPU 16GB
+# 2. ตั้งค่า Ollama Runtime เพื่อประสิทธิภาพสูงสุดบน 1x GPU 32GB (2 Parallel Slots)
 export OLLAMA_HOST="0.0.0.0:11434"
-export OLLAMA_NUM_PARALLEL="${MAX_PARALLEL_BATCHES:-4}"
+export OLLAMA_NUM_PARALLEL="${MAX_PARALLEL_BATCHES:-2}"
 export OLLAMA_MAX_LOADED_MODELS=1
 export OLLAMA_KEEP_ALIVE="-1" # ให้โมเดลอยู่ใน VRAM ตลอดเวลา ไม่ unload
+export BATCH_SIZE="${BATCH_SIZE:-60}"
 
 echo "=========================================================="
-echo "=== STARTING CENTRAL MASTER LLM NODE (Qwen2.5-14B) ==="
-echo "=== Parallel Batch Slots: ${OLLAMA_NUM_PARALLEL} ==="
+echo "=== STARTING CENTRAL MASTER LLM NODE (Qwen2.5-32B) ==="
+echo "=== Parallel Batch Slots: ${OLLAMA_NUM_PARALLEL} | Batch Size: ${BATCH_SIZE} ==="
 echo "=========================================================="
 
 # 3. รัน Ollama Service ในเบื้องหลัง
@@ -31,8 +32,8 @@ for i in {1..30}; do
     sleep 2
 done
 
-# 5. ตรวจสอบและดึงโมเดล Qwen2.5-14B (Default เป็น Q8_0 High Precision)
-MODEL_NAME="${OLLAMA_MODEL:-qwen2.5:14b-instruct-q8_0}"
+# 5. ตรวจสอบและดึงโมเดล Qwen2.5-32B (Default)
+MODEL_NAME="${OLLAMA_MODEL:-qwen2.5:32b}"
 if ! ollama list | grep -q "$MODEL_NAME"; then
     echo "Pulling $MODEL_NAME into Ollama (this will take 1-3 minutes on first boot)..."
     ollama pull "$MODEL_NAME"

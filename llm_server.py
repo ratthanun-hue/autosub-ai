@@ -73,8 +73,8 @@ def resolve_gemini_api_key(req_key: Optional[str] = None) -> str:
         pass
     return ""
 
-# Concurrency control: Allow concurrent batch refinements (Configurable via MAX_PARALLEL_BATCHES, default: 4)
-MAX_PARALLEL_BATCHES = int(os.environ.get("MAX_PARALLEL_BATCHES", "4"))
+# Concurrency control: Allow 2 concurrent batch refinements (Safe with num_ctx=8192 on 32GB VRAM)
+MAX_PARALLEL_BATCHES = int(os.environ.get("MAX_PARALLEL_BATCHES", "2"))
 LLM_SEMAPHORE = threading.Semaphore(MAX_PARALLEL_BATCHES)
 active_requests = 0
 active_requests_lock = threading.Lock()
@@ -147,7 +147,7 @@ def warmup_model():
             data=req_body,
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
+        with urllib.request.urlopen(req, timeout=240.0) as resp:
             pass
         logger.info(f"Model {DEFAULT_MODEL} successfully warmed up in VRAM with keep_alive=-1")
     except Exception as e:
@@ -331,11 +331,11 @@ def index_dashboard():
         <div class="grid">
             <div class="card">
                 <div class="card-label">AI Model</div>
-                <div class="card-val blue" id="valModel">Qwen2.5-14B</div>
+                <div class="card-val blue" id="valModel">Qwen2.5-32B</div>
             </div>
             <div class="card">
                 <div class="card-label">GPU Hardware</div>
-                <div class="card-val" id="valGPU">RTX A4000 16GB</div>
+                <div class="card-val" id="valGPU">Tesla V100 32GB</div>
             </div>
             <div class="card">
                 <div class="card-label">Ollama Engine</div>
@@ -357,7 +357,7 @@ def index_dashboard():
                 <label>ข้อความซับไตเติลภาษาไทยที่ต้องการตรวจแก้ (Subtitle Text)</label>
                 <textarea id="subText">สวัสดีเจ้าค่ะ แม่นาย</textarea>
             </div>
-            <button class="btn" onclick="runProofread()">⚡ สั่ง Refine ผ่าน Qwen2.5-14B</button>
+            <button class="btn" onclick="runProofread()">⚡ สั่ง Refine ผ่าน Qwen2.5-32B</button>
             <div id="resultBox"></div>
         </div>
 
@@ -414,6 +414,19 @@ def index_dashboard():
 """
     return HTMLResponse(content=html_content)
 
+def get_gpu_info():
+    try:
+        cmd = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        if res.returncode == 0 and res.stdout.strip():
+            parts = [p.strip() for p in res.stdout.strip().split(",")]
+            name = parts[0]
+            total_mb = float(parts[1]) if len(parts) > 1 and parts[1].replace('.','',1).isdigit() else 32768
+            return name, round(total_mb / 1024, 1)
+    except Exception:
+        pass
+    return "Tesla V100 32GB", 32.0
+
 @app.get("/health")
 def health_check():
     ollama_ok = check_ollama_status()
@@ -421,15 +434,16 @@ def health_check():
         req_count = active_requests
     with total_completed_lock:
         done_count = total_completed_jobs
+    gpu_name, vram_gb = get_gpu_info()
     return {
         "status": "ok" if ollama_ok else "degraded",
         "service": "autosub-central-master-llm",
         "ollama_connected": ollama_ok,
         "ollama_url": OLLAMA_URL,
         "model": DEFAULT_MODEL,
-        "gpu": "RTX A4000 16GB",
+        "gpu": gpu_name,
         "role": "master_llm",
-        "vram_gb": 16,
+        "vram_gb": vram_gb,
         "active_jobs": req_count,
         "jobs_completed": done_count,
         "server_time": time.time()
@@ -442,23 +456,33 @@ def get_gpu_stats():
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
         if res.returncode == 0 and res.stdout.strip():
             parts = [p.strip() for p in res.stdout.strip().split(",")]
+            util = int(float(parts[0])) if parts[0].replace('.','',1).isdigit() else 0
+            used_mb = int(float(parts[1])) if parts[1].replace('.','',1).isdigit() else 0
+            total_mb = int(float(parts[2])) if parts[2].replace('.','',1).isdigit() else 32768
+            temp = int(float(parts[3])) if parts[3].replace('.','',1).isdigit() else 0
+            power = 0.0
+            if len(parts) > 4:
+                try:
+                    power = round(float(parts[4]), 1)
+                except Exception:
+                    power = 0.0
             return {
-                "gpu_util_percent": int(float(parts[0])),
-                "mem_used_mb": int(float(parts[1])),
-                "mem_total_mb": int(float(parts[2])),
-                "mem_used_gb": round(float(parts[1]) / 1024, 2),
-                "mem_total_gb": round(float(parts[2]) / 1024, 2),
-                "temp_c": int(float(parts[3])),
-                "power_watts": round(float(parts[4]), 1) if len(parts) > 4 else 0
+                "gpu_util_percent": util,
+                "mem_used_mb": used_mb,
+                "mem_total_mb": total_mb,
+                "mem_used_gb": round(used_mb / 1024, 2),
+                "mem_total_gb": round(total_mb / 1024, 2),
+                "temp_c": temp,
+                "power_watts": power
             }
     except Exception:
         pass
     return {
         "gpu_util_percent": 0,
         "mem_used_mb": 0,
-        "mem_total_mb": 16376,
+        "mem_total_mb": 32768,
         "mem_used_gb": 0,
-        "mem_total_gb": 16.0,
+        "mem_total_gb": 32.0,
         "temp_c": 0,
         "power_watts": 0
     }
@@ -590,7 +614,6 @@ def refine_subtitles_gemini(
                     if "->" in new_text or "→" in new_text:
                         parts = re.split(r'\s*(?:->|→)\s*', new_text)
                         new_text = parts[-1].strip()
-                    new_text = re.sub(r'^[\'"]|[\'"]$', '', new_text).strip()
                     if new_text and new_text != s.get("text", ""):
                         s["text"] = new_text
                         total_corrected += 1
@@ -638,12 +661,13 @@ def refine_subtitles(req_data: RefineRequest):
         except Exception as g_err:
             logger.warning(f"[GEMINI NOTICE] Gemini call failed ({g_err}). Auto-Fallback to Local Ollama...")
 
-    # Route 2: Local Ollama (Qwen2.5-14B) - Default / Fallback
+    # Route 2: Local Ollama (Qwen2.5-32B) - Default / Fallback
     model = req_data.model or DEFAULT_MODEL
-    # Auto-upgrade to 14B on Master Node when 7b is requested by older workers
-    if model in ("qwen2.5:7b", "qwen2.5", ""):
-        model = DEFAULT_MODEL
-    batch_size = max(10, min(req_data.batch_size or 25, 40))
+    # Master Node runs DEFAULT_MODEL (e.g. qwen2.5:32b). Auto-map any incoming model name.
+    model = DEFAULT_MODEL
+    batch_size = int(os.environ.get("BATCH_SIZE", "60"))
+    if req_data.batch_size and req_data.batch_size >= 50:
+        batch_size = min(req_data.batch_size, 75)
 
     if not check_ollama_status():
         logger.warning(f"Ollama is unreachable at {OLLAMA_URL}. Returning original cues as fallback.")
@@ -655,9 +679,9 @@ def refine_subtitles(req_data: RefineRequest):
             "duration_sec": 0.0
         }
 
-    acquired = LLM_SEMAPHORE.acquire(timeout=600.0)
+    acquired = LLM_SEMAPHORE.acquire(timeout=1800.0)
     if not acquired:
-        logger.warning(f"Master LLM semaphore timeout after 600s for drama '{drama_title}'. Returning original cues.")
+        logger.warning(f"Master LLM semaphore timeout after 1800s for drama '{drama_title}'. Returning original cues.")
         return {
             "status": "busy_fallback",
             "message": "Master LLM queue busy",
@@ -670,7 +694,7 @@ def refine_subtitles(req_data: RefineRequest):
         active_requests += 1
 
     t_start = time.time()
-    logger.info(f"Processing LLM refinement request: {len(segments)} cues, drama='{drama_title}', chars={len(known_chars)}")
+    logger.info(f"Processing LLM refinement request: {len(segments)} cues (batch_size={batch_size}), drama='{drama_title}', chars={len(known_chars)}")
 
     try:
         char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
@@ -684,7 +708,7 @@ def refine_subtitles(req_data: RefineRequest):
             "2. แก้ไขคำพ้องเสียงหรือคำที่ Whisper ฟังเพี้ยนจากเสียงพูด เช่น 'เต้นความ' แก้เป็น 'แจ้งความ', 'จุดรวช' แก้เป็น 'ตำรวจ', 'พลิกแฟร์ม' แก้เป็น 'พลิกแฟ้ม', 'โมโมง' แก้เป็น 'หมองมัว', 'สาปศูนย์' แก้เป็น 'สาบสูญ'\n"
             "3. ข้อห้ามเด็ดขาด: ห้ามแต่งประโยคใหม่, ห้ามเติมคำลงท้าย (เช่น ห้ามเติม ค่ะ/ครับ/ฮะ ถ้าต้นฉบับไม่มี), และห้ามตัดทอนคำออก\n"
             "4. ข้อห้ามเรื่องรูปแบบ: ให้ส่งเฉพาะประโยคหรือข้อความที่แก้ไขสมบูรณ์แล้วเท่านั้น ห้ามใส่เครื่องหมายลูกศร (-> หรือ →) หรือข้อความเปรียบเทียบเดิมเด็ดขาด เช่น ให้ส่ง 'ตำรวจ' ห้ามส่ง 'จุดรวช -> ตำรวจ'\n"
-            "5. กฎสำคัญด้านความเร็ว (Diff-Only): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {\"2\": \"ข้อความที่แก้แล้ว\"} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {}"
+            "5. กฎสำคัญด้านความเร็ว (Diff-Only): ส่งผลลัพธ์เป็น JSON Object เฉพาะ ID ที่มีการแก้ไขคำผิดเท่านั้น เช่น {{\"2\": \"ข้อความที่แก้แล้ว\"}} ห้ามใส่ ID ที่ถูกต้องอยู่แล้วลงมาในผลลัพธ์เด็ดขาด หากไม่มีคำผิดเลยให้ส่ง {{}}\n"
         )
 
         refined_segments = [dict(s) for s in segments]
@@ -702,7 +726,8 @@ def refine_subtitles(req_data: RefineRequest):
                     "keep_alive": -1,
                     "options": {
                         "temperature": 0.1,
-                        "num_predict": 1024
+                        "num_predict": 1024,
+                        "num_ctx": 4096
                     },
                     "messages": [
                         {"role": "system", "content": system_prompt},
@@ -717,7 +742,7 @@ def refine_subtitles(req_data: RefineRequest):
                     headers={"Content-Type": "application/json; charset=utf-8"}
                 )
 
-                with urllib.request.urlopen(req, timeout=120.0) as resp:
+                with urllib.request.urlopen(req, timeout=360.0) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     content = resp_json.get("message", {}).get("content", "").strip()
 
@@ -886,23 +911,26 @@ def _process_async_refine(job: AsyncRefineRequest):
     with active_requests_lock:
         active_requests += 1
 
-    # Generous queue timeout (30 mins) so no job is dropped
-    acquired = LLM_SEMAPHORE.acquire(timeout=1800.0)
+    # Generous queue timeout (6.0 hours / 21600s) for sequential 32B drama queues
+    acquired = LLM_SEMAPHORE.acquire(timeout=21600.0)
     if not acquired:
-        logger.error(f"[ASYNC TIMEOUT] Semaphore queue timeout for custom_id='{custom_id}'")
+        logger.error(f"[ASYNC TIMEOUT] Semaphore queue timeout (21600s / 6h) for custom_id='{custom_id}'")
         with active_requests_lock:
             active_requests -= 1
         _send_fallback_webhook(job, "LLM queue busy")
         return
 
+    logger.info(f"[ASYNC QUEUE ACQUIRED] Semaphore slot acquired for custom_id='{custom_id}', drama='{job.drama_title}' after {round(time.time() - t_start, 1)}s queue wait.")
+
     try:
         segments = [dict(s) for s in job.segments]
         drama_title = job.drama_title or "ทั่วไป"
         known_chars = job.known_chars or []
-        model = job.model or DEFAULT_MODEL
-        if model in ("qwen2.5:7b", "qwen2.5", ""):
-            model = DEFAULT_MODEL
-        batch_size = max(10, min(job.batch_size or 25, 40))
+        # Master Node runs DEFAULT_MODEL (e.g. qwen2.5:32b). Auto-map any incoming model name.
+        model = DEFAULT_MODEL
+        batch_size = int(os.environ.get("BATCH_SIZE", "60"))
+        if job.batch_size and job.batch_size >= 50:
+            batch_size = min(job.batch_size, 75)
 
         char_str = ", ".join(known_chars[:12]) if known_chars else "ไม่ระบุ"
         total_corrected = 0
@@ -930,7 +958,7 @@ def _process_async_refine(job: AsyncRefineRequest):
             except Exception as g_err:
                 logger.warning(f"[GEMINI ASYNC NOTICE] Gemini failed ({g_err}). Auto-Fallback to Local Ollama...")
 
-        # Route 2: Local Ollama (Qwen2.5-14B) - Fallback or when engine=ollama
+        # Route 2: Local Ollama (Qwen2.5-32B) - Fallback or when engine=ollama
         if not gemini_success:
             system_prompt = (
                 f"คุณคือ AI ผู้เชี่ยวชาญด้านการตรวจทานซับไตเติลภาษาไทย (Thai Subtitle Contextual Proofreader)\n"
@@ -956,7 +984,7 @@ def _process_async_refine(job: AsyncRefineRequest):
                         "format": "json",
                         "stream": False,
                         "keep_alive": -1,
-                        "options": {"temperature": 0.1, "num_predict": 1024},
+                        "options": {"temperature": 0.1, "num_predict": 1024, "num_ctx": 4096},
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"จงตรวจแก้ซับไตเติลต่อไปนี้ และส่งคืนเฉพาะ ID ที่มีคำผิด (หากไม่มีคำผิดให้ส่ง {{}}):\n{json.dumps(cues_dict, ensure_ascii=False, indent=2)}"}
@@ -968,7 +996,7 @@ def _process_async_refine(job: AsyncRefineRequest):
                         data=req_body,
                         headers={"Content-Type": "application/json; charset=utf-8"}
                     )
-                    with urllib.request.urlopen(req, timeout=120.0) as resp:
+                    with urllib.request.urlopen(req, timeout=400.0) as resp:
                         resp_json = json.loads(resp.read().decode("utf-8"))
                         content = resp_json.get("message", {}).get("content", "").strip()
 
@@ -1078,9 +1106,8 @@ def refine_subtitles_async(req_data: AsyncRefineRequest):
 @app.post("/v1/llm/translate")
 def translate_subtitles(req_data: TranslateRequest):
     global active_requests, total_completed_jobs
-    model = req_data.model or DEFAULT_MODEL
-    if model in ("qwen2.5:7b", "qwen2.5", ""):
-        model = DEFAULT_MODEL
+    # Master Node runs DEFAULT_MODEL (e.g. qwen2.5:32b). Auto-map any incoming model name.
+    model = DEFAULT_MODEL
     source_lang = req_data.source_lang or "auto"
     target_lang = req_data.target_lang or "th"
     drama_title = req_data.drama_title or "ทั่วไป"
@@ -1129,7 +1156,7 @@ def translate_subtitles(req_data: TranslateRequest):
             }
             req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=req_body, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=120.0) as resp:
+            with urllib.request.urlopen(req, timeout=240.0) as resp:
                 resp_json = json.loads(resp.read().decode("utf-8"))
                 translated = resp_json.get("message", {}).get("content", "").strip()
 
@@ -1176,7 +1203,7 @@ def translate_subtitles(req_data: TranslateRequest):
                 }
                 req_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=req_body, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=120.0) as resp:
+                with urllib.request.urlopen(req, timeout=240.0) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     content = resp_json.get("message", {}).get("content", "").strip()
                     trans_map = {}

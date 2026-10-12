@@ -840,15 +840,11 @@ _CACHED_MASTER_LLM_TIME = 0.0
 def get_master_llm_url() -> str:
     """
     Resolve the Central Master LLM URL in order of priority:
-    1. Environment variable MASTER_LLM_URL (e.g. 'http://216.234.102.170:16135')
-    2. Dynamic discovery query to Storage Server: http://ph.cdnwatch.com/subtitle.php?action=get_master_llm
+    1. Dynamic discovery query to Storage Server: http://ph.cdnwatch.com/subtitle.php?action=get_master_llm
+    2. Environment variable MASTER_LLM_URL (fallback if storage query fails and not dead IP)
     3. Fallback to Storage Server LLM Reverse Proxy: http://ph.cdnwatch.com/subtitle.php?action=llm_proxy
     """
     global _CACHED_MASTER_LLM_URL, _CACHED_MASTER_LLM_TIME
-    env_url = os.environ.get("MASTER_LLM_URL")
-    if env_url and env_url.strip():
-        return env_url.strip().rstrip("/")
-
     now = time.time()
     if _CACHED_MASTER_LLM_URL and (now - _CACHED_MASTER_LLM_TIME < 60.0):
         return _CACHED_MASTER_LLM_URL
@@ -863,14 +859,19 @@ def get_master_llm_url() -> str:
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
+                    is_alive = data.get("is_alive", True)
                     m_url = data.get("master_llm_url")
-                    if m_url and m_url.strip():
+                    if is_alive and m_url and m_url.strip():
                         _CACHED_MASTER_LLM_URL = m_url.rstrip("/")
                         _CACHED_MASTER_LLM_TIME = now
                         log_transcribe(f"[STEP 6 LLM] Discovered Active Central Master LLM: {_CACHED_MASTER_LLM_URL}")
                         return _CACHED_MASTER_LLM_URL
         except Exception:
             pass
+
+    env_url = os.environ.get("MASTER_LLM_URL")
+    if env_url and env_url.strip() and "58.8.185.95" not in env_url:
+        return env_url.strip().rstrip("/")
 
     # Fallback to Storage Reverse Proxy
     _CACHED_MASTER_LLM_URL = "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy"
@@ -981,8 +982,8 @@ def _run_remote_master_llm_refinement(
     segments: list,
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
-    model: str = "qwen2.5:14b",
-    batch_size: int = 25
+    model: str = "qwen2.5:32b",
+    batch_size: int = 60
 ) -> list:
     """
     Delegates Step 6 LLM refinement from Dynamic Node to Central Master LLM.
@@ -1095,8 +1096,8 @@ def delegate_async_refine_to_master(
     orig_filename: str = "",
     duration: float = 0.0,
     processing_time_worker: float = 0.0,
-    model: str = "qwen2.5:14b",
-    batch_size: int = 25
+    model: str = "qwen2.5:32b",
+    batch_size: int = 60
 ) -> bool:
     """
     Hands off Step 5 Thai cues to Central Master LLM for asynchronous Step 6 refinement.
