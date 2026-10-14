@@ -1,12 +1,12 @@
-# Dedicated Tier 2 Node Dockerfile (Typhoon 2.1 Gemma3 12B Thai Colloquial Flow)
+# Dedicated Step 6 Node Dockerfile (Typhoon 2.5 30B-A3B MoE Thai Colloquial Flow)
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV CUDA_VISIBLE_DEVICES=0
 ENV ROLE=step6
-ENV STAGE1_MODEL="scb10x/typhoon2.1-gemma3-12b"
-ENV OLLAMA_MODEL="scb10x/typhoon2.1-gemma3-12b"
+ENV STAGE1_MODEL="scb10x/typhoon2.5-qwen3-30b-a3b:latest"
+ENV OLLAMA_MODEL="scb10x/typhoon2.5-qwen3-30b-a3b:latest"
 ENV MAX_PARALLEL_BATCHES=2
 ENV BATCH_SIZE=25
 

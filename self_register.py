@@ -5,6 +5,22 @@ import os
 import urllib.request
 import urllib.parse
 
+def fetch_vast_api_key_from_storage():
+    urls = [
+        "http://ph.cdnwatch.com/subtitle.php?action=get_vast_key",
+        "http://23.158.40.152/subtitle.php?action=get_vast_key"
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"Host": "ph.cdnwatch.com"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                if data.get("success") and data.get("api_key"):
+                    return data["api_key"].strip()
+        except Exception:
+            pass
+    return ""
+
 VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
 if not VAST_API_KEY:
     for kp in ["/root/.vast_api_key", "/root/.config/vastai/vast_api_key"]:
@@ -16,6 +32,15 @@ if not VAST_API_KEY:
                     break
             except Exception:
                 pass
+
+if not VAST_API_KEY:
+    print("[INFO] VAST_API_KEY not found in env/files. Fetching from Storage Server...")
+    VAST_API_KEY = fetch_vast_api_key_from_storage()
+    if VAST_API_KEY:
+        print("[INFO] Successfully obtained VAST_API_KEY from Storage Server!")
+    else:
+        print("[WARN] Could not fetch VAST_API_KEY from Storage Server.")
+
 STORAGE_REGISTER_URL = os.environ.get("STORAGE_REGISTER_URL", "http://ph.cdnwatch.com/subtitle.php?action=register_node")
 LOG_FILE = "/root/whisper-server/self_register.log"
 
@@ -102,6 +127,40 @@ for attempt in range(30):
     time.sleep(5)
 
 if not public_ip or not whisper_port:
+    log("Direct Vast.ai API discovery did not yield IP/Port. Attempting Server-Side Auto-Registration by Node ID...")
+    fallback_urls = [
+        STORAGE_REGISTER_URL,
+        "http://23.158.40.152/subtitle.php?action=register_node"
+    ]
+    fb_payload = {
+        "id": str(inst_id),
+        "name": f"Dynamic GPU #{inst_id}",
+        "role": os.environ.get("ROLE", "worker")
+    }
+    fb_data = urllib.parse.urlencode(fb_payload).encode("utf-8")
+    for fb_url in fallback_urls:
+        try:
+            req_fb = urllib.request.Request(
+                fb_url,
+                data=fb_data,
+                headers={"Host": "ph.cdnwatch.com", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_fb, timeout=10) as r:
+                resp_text = r.read().decode()
+                log(f"Server-Side Registration by ID ({fb_url}): HTTP {r.status} - {resp_text}")
+                try:
+                    resp_json = json.loads(resp_text)
+                    if resp_json.get("success"):
+                        public_ip = "server_resolved"
+                        whisper_port = 10100
+                        break
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"Server-side registration attempt failed for {fb_url}: {e}")
+
+if not public_ip or not whisper_port:
     log("FAILED: Could not discover external IP/Port within timeout.")
     exit(1)
 
@@ -111,14 +170,22 @@ def send_worker_registration():
         STORAGE_REGISTER_URL,
         "http://23.158.40.152/subtitle.php?action=register_node"
     ]
-    payload = {
-        "ip": public_ip,
-        "port": str(whisper_port),
-        "id": str(inst_id),
-        "name": f"Dynamic GPU #{inst_id}",
-        "gpu": gpu_name,
-        "role": os.environ.get("ROLE", "worker")
-    }
+    if public_ip == "server_resolved":
+        payload = {
+            "id": str(inst_id),
+            "name": f"Dynamic GPU #{inst_id}",
+            "gpu": gpu_name,
+            "role": os.environ.get("ROLE", "worker")
+        }
+    else:
+        payload = {
+            "ip": public_ip,
+            "port": str(whisper_port),
+            "id": str(inst_id),
+            "name": f"Dynamic GPU #{inst_id}",
+            "gpu": gpu_name,
+            "role": os.environ.get("ROLE", "worker")
+        }
     post_data = urllib.parse.urlencode(payload).encode("utf-8")
     for reg_url in urls:
         try:

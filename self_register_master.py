@@ -16,6 +16,22 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+def fetch_vast_api_key_from_storage():
+    urls = [
+        "http://ph.cdnwatch.com/subtitle.php?action=get_vast_key",
+        "http://23.158.40.152/subtitle.php?action=get_vast_key"
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={"Host": "ph.cdnwatch.com"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                if data.get("success") and data.get("api_key"):
+                    return data["api_key"].strip()
+        except Exception:
+            pass
+    return ""
+
 VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
 if not VAST_API_KEY:
     for kp in ["/root/.vast_api_key", "/root/.config/vastai/vast_api_key"]:
@@ -27,6 +43,14 @@ if not VAST_API_KEY:
                     break
             except Exception:
                 pass
+
+if not VAST_API_KEY:
+    print("[INFO] VAST_API_KEY not found in env/files. Fetching from Storage Server...")
+    VAST_API_KEY = fetch_vast_api_key_from_storage()
+    if VAST_API_KEY:
+        print("[INFO] Successfully obtained VAST_API_KEY from Storage Server!")
+    else:
+        print("[WARN] Could not fetch VAST_API_KEY from Storage Server.")
 
 STORAGE_REGISTER_URL = os.environ.get(
     "STORAGE_MASTER_REGISTER_URL",

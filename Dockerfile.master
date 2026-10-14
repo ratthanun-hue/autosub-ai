@@ -1,9 +1,16 @@
-# Master LLM Node Dockerfile (Ollama + Qwen2.5-32B + FastAPI Master Server)
+# Master LLM Node Dockerfile (Ollama + Typhoon 2.5 30B-A3B MoE + FastAPI Master Server)
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV CUDA_VISIBLE_DEVICES=0
+ENV ROLE=single_stage
+ENV STAGE1_MODEL="scb10x/typhoon2.5-qwen3-30b-a3b:latest"
+ENV STAGE2_MODEL="none"
+ENV DISABLE_STEP7="1"
+ENV OLLAMA_MODEL="scb10x/typhoon2.5-qwen3-30b-a3b:latest"
+ENV MAX_PARALLEL_BATCHES=2
+ENV BATCH_SIZE=25
 
 # ติดตั้ง System Packages, Python3, Pip, zstd, และ Curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -35,10 +42,14 @@ WORKDIR /root/whisper-server
 COPY llm_server.py .
 COPY self_register_master.py .
 COPY port_bridge.py .
+COPY thai_corrections.json .
+COPY thai_slang_words.json .
+COPY drama_character_knowledge.json .
 COPY entrypoint_master.sh /usr/local/bin/entrypoint_master.sh
 
 RUN chmod +x /usr/local/bin/entrypoint_master.sh && \
-    ln -s /usr/local/bin/entrypoint_master.sh /entrypoint.sh
+    ln -sf /usr/local/bin/entrypoint_master.sh /usr/local/bin/entrypoint.sh && \
+    ln -sf /usr/local/bin/entrypoint_master.sh /entrypoint.sh
 
 # พอร์ต 10200 = Master LLM FastAPI, 11434 = Ollama (Local/Internal), 22 = SSH
 EXPOSE 10200 11434 22
