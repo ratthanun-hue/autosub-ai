@@ -70,7 +70,7 @@ log("Step 1: Waiting for local Master LLM service to be ready on port 10200...")
 local_ready = False
 for attempt in range(60):  # up to 3 minutes
     try:
-        with urllib.request.urlopen("http://localhost:10200/health", timeout=3) as r:
+        with urllib.request.urlopen("http://127.0.0.1:10200/health", timeout=3) as r:
             if r.status == 200:
                 local_ready = True
                 log("Local Master LLM service (port 10200) is READY!")
@@ -131,28 +131,38 @@ if not public_ip or not master_port:
 
 if not public_ip or not master_port:
     log("FAILED: Could not discover external IP/Port within timeout.")
-    # If failed to query vast, check if we can register local IP or exit
     sys.exit(1)
 
 # 3. Post registration payload to Storage Server
 def send_registration():
-    try:
-        payload = {
-            "ip": public_ip,
-            "port": str(master_port),
-            "id": str(inst_id),
-            "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:14b-instruct-q8_0"),
-            "token": MASTER_AUTH_TOKEN
-        }
-        post_data = urllib.parse.urlencode(payload).encode("utf-8")
-        req_reg = urllib.request.Request(STORAGE_REGISTER_URL, data=post_data, method="POST")
-        with urllib.request.urlopen(req_reg, timeout=10) as resp:
-            resp_body = resp.read().decode()
-            log(f"Registration response: {resp.status} - {resp_body}")
-            return resp.status == 200
-    except Exception as e:
-        log(f"Registration error: {e}")
-        return False
+    urls_to_try = [
+        STORAGE_REGISTER_URL,
+        "http://23.158.40.152/subtitle.php?action=register_master_llm"
+    ]
+    payload = {
+        "ip": public_ip,
+        "port": str(master_port),
+        "id": str(inst_id),
+        "role": os.environ.get("ROLE", ""),
+        "model": os.environ.get("OLLAMA_MODEL", "Typhoon2-8B + Qwen14B-Q8 Cascade"),
+        "token": MASTER_AUTH_TOKEN
+    }
+    post_data = urllib.parse.urlencode(payload).encode("utf-8")
+    for reg_url in urls_to_try:
+        try:
+            req_reg = urllib.request.Request(
+                reg_url,
+                data=post_data,
+                headers={"Host": "ph.cdnwatch.com", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_reg, timeout=10) as resp:
+                resp_body = resp.read().decode()
+                log(f"Registration response ({reg_url}): {resp.status} - {resp_body}")
+                return resp.status == 200
+        except Exception as e:
+            log(f"Registration attempt to {reg_url} failed: {e}")
+    return False
 
 log(f"Step 3: Registering Master Node at {STORAGE_REGISTER_URL}...")
 registered = send_registration()
@@ -162,10 +172,10 @@ log("Step 4: Entering Heartbeat loop (every 30s)...")
 while True:
     time.sleep(30)
     try:
-        # Check if local Master service is still alive
+        # Check if local Master service is still alive on 127.0.0.1
         is_healthy = False
         try:
-            with urllib.request.urlopen("http://localhost:10200/health", timeout=3) as r:
+            with urllib.request.urlopen("http://127.0.0.1:10200/health", timeout=3) as r:
                 is_healthy = (r.status == 200)
         except Exception:
             is_healthy = False
@@ -173,6 +183,6 @@ while True:
         if is_healthy:
             send_registration()
         else:
-            log("WARN: Local Master LLM on 10200 not responding, skipping heartbeat this cycle")
+            log("WARN: Local Master LLM on 127.0.0.1:10200 not responding, skipping heartbeat this cycle")
     except Exception as e:
         log(f"Heartbeat loop exception: {e}")

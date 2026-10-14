@@ -45,10 +45,26 @@ if [ -f "/root/whisper-server/self_register.py" ]; then
     nohup $PYTHON_BIN /root/whisper-server/self_register.py > /root/whisper-server/self_register.log 2>&1 &
 fi
 
-# 5. เริ่มต้นรัน FastAPI / Uvicorn Server บนพอร์ต 10100 (Steps 0-5 Audio Pipeline)
+# 4.5 Background Watchdog for Self-Registration
+(
+    while true; do
+        sleep 15
+        if [ -f "/root/whisper-server/self_register.py" ] && ! pgrep -f "self_register.py" > /dev/null; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCHDOG] self_register.py dead! Auto-restarting..." >> /root/whisper-server/watchdog.log 2>&1
+            nohup $PYTHON_BIN /root/whisper-server/self_register.py >> /root/whisper-server/self_register.log 2>&1 &
+        fi
+    done
+) &
+
+# 5. เริ่มต้นรัน FastAPI / Uvicorn Server บนพอร์ต 10100 (Auto-Heal Enabled)
 CONCURRENCY_JOBS="${MAX_JOBS_PER_NODE:-3}"
 echo "=========================================================="
-echo "=== STARTING AUTOSUB-AI DYNAMIC WORKER (STEPS 0-5) ==="
+echo "=== STARTING AUTOSUB-AI DYNAMIC WORKER (AUTO-HEAL ENABLED) ==="
 echo "=== Concurrency Limit: ${CONCURRENCY_JOBS} jobs ==="
 echo "=========================================================="
-exec $UVICORN_BIN app:app --host 0.0.0.0 --port 10100 --workers 1
+while true; do
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Uvicorn app:app on port 10100..."
+    $UVICORN_BIN app:app --host 0.0.0.0 --port 10100 --workers 1 || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [AUTO-HEAL] Uvicorn worker exited. Auto-healing in 3 seconds..."
+    sleep 3
+done

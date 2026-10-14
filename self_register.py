@@ -106,23 +106,57 @@ if not public_ip or not whisper_port:
     exit(1)
 
 # 3. Post registration payload to Storage Server
-log(f"Step 3: Registering node with Storage Server at {STORAGE_REGISTER_URL}...")
-payload = {
-    "ip": public_ip,
-    "port": str(whisper_port),
-    "id": str(inst_id),
-    "name": f"Dynamic GPU #{inst_id}",
-    "gpu": gpu_name
-}
+def send_worker_registration():
+    urls = [
+        STORAGE_REGISTER_URL,
+        "http://23.158.40.152/subtitle.php?action=register_node"
+    ]
+    payload = {
+        "ip": public_ip,
+        "port": str(whisper_port),
+        "id": str(inst_id),
+        "name": f"Dynamic GPU #{inst_id}",
+        "gpu": gpu_name,
+        "role": os.environ.get("ROLE", "worker")
+    }
+    post_data = urllib.parse.urlencode(payload).encode("utf-8")
+    for reg_url in urls:
+        try:
+            req_reg = urllib.request.Request(
+                reg_url,
+                data=post_data,
+                headers={"Host": "ph.cdnwatch.com", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_reg, timeout=10) as r:
+                resp_text = r.read().decode()
+                log(f"Registration Response ({reg_url}): HTTP {r.status} - {resp_text}")
+                return True
+        except Exception as e:
+            log(f"Registration failed for {reg_url}: {e}")
+    return False
 
-post_data = urllib.parse.urlencode(payload).encode("utf-8")
-req_reg = urllib.request.Request(STORAGE_REGISTER_URL, data=post_data, method="POST")
+log(f"Step 3: Registering node with Storage Server...")
+if send_worker_registration():
+    log("=== REGISTRATION COMPLETE: NODE IS NOW RECEIVING JOBS! ===")
+else:
+    log("Initial registration warning: will retry in heartbeat loop")
 
-try:
-    with urllib.request.urlopen(req_reg, timeout=10) as r:
-        resp_text = r.read().decode()
-        log(f"Registration Response: HTTP {r.status} - {resp_text}")
-        log("=== REGISTRATION COMPLETE: NODE IS NOW RECEIVING JOBS! ===")
-except Exception as e:
-    log(f"Registration FAILED: {e}")
-    exit(1)
+# 4. Continuous Heartbeat Loop (every 30s)
+log("Step 4: Entering continuous heartbeat loop (every 30s)...")
+while True:
+    time.sleep(30)
+    try:
+        is_healthy = False
+        try:
+            with urllib.request.urlopen("http://localhost:10100/health", timeout=3) as r:
+                is_healthy = (r.status == 200)
+        except Exception:
+            is_healthy = False
+
+        if is_healthy:
+            send_worker_registration()
+        else:
+            log("WARN: Local Whisper service on port 10100 not healthy, skipping heartbeat this cycle")
+    except Exception as e:
+        log(f"Heartbeat loop exception: {e}")

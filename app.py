@@ -230,10 +230,10 @@ def log_failed_job(
 # ==========================================
 # GPU CONCURRENCY LIMITER (Staged Pipeline Semaphores)
 # ==========================================
-MAX_JOBS_PER_NODE = int(os.environ.get("MAX_JOBS_PER_NODE", "3"))
-GPU_JOB_SEMAPHORE = threading.Semaphore(MAX_JOBS_PER_NODE)  # Staged pipeline concurrency (default: 3, supports 3-4)
+MAX_JOBS_PER_NODE = int(os.environ.get("MAX_JOBS_PER_NODE", "1"))
+GPU_JOB_SEMAPHORE = threading.Semaphore(MAX_JOBS_PER_NODE)  # Strict single-job execution on 12GB VRAM cards
 DEMUCS_SEMAPHORE = threading.Semaphore(1)   # Gate heavy HDemucs vocal isolation to 1 at a time
-WHISPER_SEMAPHORE = threading.Semaphore(2)  # Whisper inference supports up to 2 concurrent streams
+WHISPER_SEMAPHORE = threading.Semaphore(1)  # Whisper inference single stream to prevent VRAM collision
 TYPHOON_SEMAPHORE = threading.Semaphore(1)  # Gate Typhoon CTC PyTorch forward pass to 1 at a time
 
 # ==========================================
@@ -833,21 +833,20 @@ def check_ollama_available(ollama_url: str = "http://127.0.0.1:11434") -> bool:
     except Exception:
         return False
 
-# Cache for resolved Master LLM URL
-_CACHED_MASTER_LLM_URL = None
-_CACHED_MASTER_LLM_TIME = 0.0
+# Cache for resolved LLM Endpoints
+_CACHED_LLM_ENDPOINTS = {}
+_CACHED_LLM_ENDPOINTS_TIME = 0.0
 
-def get_master_llm_url() -> str:
+def get_llm_endpoints() -> dict:
     """
-    Resolve the Central Master LLM URL in order of priority:
-    1. Dynamic discovery query to Storage Server: http://ph.cdnwatch.com/subtitle.php?action=get_master_llm
-    2. Environment variable MASTER_LLM_URL (fallback if storage query fails and not dead IP)
-    3. Fallback to Storage Server LLM Reverse Proxy: http://ph.cdnwatch.com/subtitle.php?action=llm_proxy
+    Query Storage Server for live 3-Tier Multi-Node endpoints (Tier 2 Typhoon & Tier 3 Qwen).
+    Returns dict with keys:
+      master_llm_url, stage1_llm_url, stage2_llm_url, stage1_alive, stage2_alive, is_alive
     """
-    global _CACHED_MASTER_LLM_URL, _CACHED_MASTER_LLM_TIME
+    global _CACHED_LLM_ENDPOINTS, _CACHED_LLM_ENDPOINTS_TIME
     now = time.time()
-    if _CACHED_MASTER_LLM_URL and (now - _CACHED_MASTER_LLM_TIME < 60.0):
-        return _CACHED_MASTER_LLM_URL
+    if _CACHED_LLM_ENDPOINTS and (now - _CACHED_LLM_ENDPOINTS_TIME < 45.0):
+        return _CACHED_LLM_ENDPOINTS
 
     storage_candidates = [
         "http://ph.cdnwatch.com/subtitle.php?action=get_master_llm",
@@ -855,28 +854,50 @@ def get_master_llm_url() -> str:
     ]
     for surl in storage_candidates:
         try:
-            req = urllib.request.Request(surl, headers={"User-Agent": "AutoSub-DynamicNode/2.0"})
+            req = urllib.request.Request(surl, headers={"User-Agent": "AutoSub-Worker/3.0"})
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
-                    is_alive = data.get("is_alive", True)
-                    m_url = data.get("master_llm_url")
-                    if is_alive and m_url and m_url.strip():
-                        _CACHED_MASTER_LLM_URL = m_url.rstrip("/")
-                        _CACHED_MASTER_LLM_TIME = now
-                        log_transcribe(f"[STEP 6 LLM] Discovered Active Central Master LLM: {_CACHED_MASTER_LLM_URL}")
-                        return _CACHED_MASTER_LLM_URL
+                    endpoints = {
+                        "master_llm_url": (data.get("master_llm_url") or "").rstrip("/"),
+                        "stage1_llm_url": (data.get("stage1_llm_url") or "").rstrip("/"),
+                        "stage2_llm_url": (data.get("stage2_llm_url") or "").rstrip("/"),
+                        "stage1_alive": bool(data.get("stage1_alive")),
+                        "stage2_alive": bool(data.get("stage2_alive")),
+                        "is_alive": bool(data.get("is_alive", True)),
+                        "model": data.get("model", "")
+                    }
+                    if endpoints["master_llm_url"] or endpoints["stage2_llm_url"]:
+                        _CACHED_LLM_ENDPOINTS = endpoints
+                        _CACHED_LLM_ENDPOINTS_TIME = now
+                        log_transcribe(
+                            f"[LLM DISCOVERY] Tier 2 (Typhoon): {endpoints['stage1_llm_url'] or 'N/A'} (alive={endpoints['stage1_alive']}) | "
+                            f"Tier 3 (Qwen): {endpoints['stage2_llm_url'] or endpoints['master_llm_url']} (alive={endpoints['stage2_alive']})"
+                        )
+                        return _CACHED_LLM_ENDPOINTS
         except Exception:
             pass
 
-    env_url = os.environ.get("MASTER_LLM_URL")
-    if env_url and env_url.strip() and "58.8.185.95" not in env_url:
-        return env_url.strip().rstrip("/")
+    env_m = os.environ.get("MASTER_LLM_URL", "").strip().rstrip("/")
+    env_s1 = os.environ.get("STAGE1_LLM_URL", "").strip().rstrip("/")
+    env_s2 = os.environ.get("STAGE2_LLM_URL", "").strip().rstrip("/")
+    fallback = {
+        "master_llm_url": env_m or env_s2 or "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy",
+        "stage1_llm_url": env_s1,
+        "stage2_llm_url": env_s2 or env_m,
+        "stage1_alive": bool(env_s1),
+        "stage2_alive": bool(env_s2 or env_m),
+        "is_alive": True,
+        "model": "qwen2.5:14b"
+    }
+    _CACHED_LLM_ENDPOINTS = fallback
+    _CACHED_LLM_ENDPOINTS_TIME = now
+    return _CACHED_LLM_ENDPOINTS
 
-    # Fallback to Storage Reverse Proxy
-    _CACHED_MASTER_LLM_URL = "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy"
-    _CACHED_MASTER_LLM_TIME = now
-    return _CACHED_MASTER_LLM_URL
+def get_master_llm_url() -> str:
+    """Resolve active Master / Stage 2 LLM URL."""
+    eps = get_llm_endpoints()
+    return eps.get("stage2_llm_url") or eps.get("master_llm_url") or "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy"
 
 def _run_local_ollama_refinement(
     segments: list,
@@ -989,6 +1010,66 @@ def _run_remote_master_llm_refinement(
     Delegates Step 6 LLM refinement from Dynamic Node to Central Master LLM.
     Fail-safe: Returns original Step 5 cues if Master is busy, offline, or returns error.
     """
+    # 1. Check for Decoupled 3-Tier Multi-Node Setup (Separate Step 6 and Step 7 Nodes)
+    eps = get_llm_endpoints()
+    s1_url = os.environ.get("STAGE1_LLM_URL", "").strip().rstrip("/")
+    if not s1_url and eps.get("stage1_alive") and eps.get("stage1_llm_url"):
+        s1_url = eps["stage1_llm_url"]
+
+    s2_url = os.environ.get("STAGE2_LLM_URL", "").strip().rstrip("/")
+    if not s2_url and eps.get("stage2_alive") and eps.get("stage2_llm_url"):
+        s2_url = eps["stage2_llm_url"]
+
+    if s1_url and s2_url and s1_url != s2_url:
+        t_start = time.time()
+        log_transcribe(f"[STEP 6-7 3-TIER DECOUPLED] Executing 3-Tier Pipeline (Step 6 @ {s1_url} -> Step 7 @ {s2_url})...")
+        stage1_segments = list(segments)
+        try:
+            req_body_s1 = json.dumps({
+                "segments": segments,
+                "drama_title": drama_title,
+                "known_chars": known_chars or [],
+                "batch_size": batch_size
+            }, ensure_ascii=False).encode("utf-8")
+            req_s1 = urllib.request.Request(
+                f"{s1_url}/v1/llm/stage1",
+                data=req_body_s1,
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-Worker/3.0"}
+            )
+            with urllib.request.urlopen(req_s1, timeout=max(120.0, float(len(segments) * 0.25 + 30.0))) as resp_s1:
+                if resp_s1.status == 200:
+                    res_s1 = json.loads(resp_s1.read().decode("utf-8"))
+                    if res_s1.get("status") == "success" and "segments" in res_s1:
+                        stage1_segments = res_s1["segments"]
+                        log_transcribe(f"[STEP 6 TYPHOON SUCCESS] Stage 1 completed in {res_s1.get('duration_sec', 0)}s.")
+        except Exception as ex_s1:
+            log_transcribe(f"[STEP 6 TYPHOON WARN] Stage 1 failed: {ex_s1}. Passing original cues to Step 7.")
+
+        try:
+            req_body_s2 = json.dumps({
+                "segments": stage1_segments,
+                "drama_title": drama_title,
+                "known_chars": known_chars or [],
+                "batch_size": batch_size
+            }, ensure_ascii=False).encode("utf-8")
+            req_s2 = urllib.request.Request(
+                f"{s2_url}/v1/llm/stage2",
+                data=req_body_s2,
+                headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-Worker/3.0"}
+            )
+            with urllib.request.urlopen(req_s2, timeout=max(120.0, float(len(segments) * 0.25 + 30.0))) as resp_s2:
+                if resp_s2.status == 200:
+                    res_s2 = json.loads(resp_s2.read().decode("utf-8"))
+                    if res_s2.get("status") == "success" and "segments" in res_s2:
+                        ret_segments = res_s2["segments"]
+                        dur_tot = round(time.time() - t_start, 2)
+                        log_transcribe(f"[STEP 7 QWEN SUCCESS] 3-Tier Pipeline completed successfully in {dur_tot}s (corrected: {res_s2.get('corrected_count', 0)}).")
+                        return ret_segments
+        except Exception as ex_s2:
+            log_transcribe(f"[STEP 7 QWEN WARN] Stage 2 failed: {ex_s2}. Using Stage 1 cues.")
+            return stage1_segments
+
+    # 2. Unified Master LLM (2-Stage Cascade Single Node)
     master_url = get_master_llm_url()
     t_start = time.time()
     log_transcribe(f"[STEP 6 CENTRAL LLM] Delegating {len(segments)} cues to Central Master LLM ({master_url})...")
