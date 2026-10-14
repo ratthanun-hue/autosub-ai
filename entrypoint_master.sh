@@ -11,13 +11,21 @@ export OLLAMA_NUM_PARALLEL="${MAX_PARALLEL_BATCHES:-2}"
 export OLLAMA_KEEP_ALIVE="-1" # ให้โมเดลอยู่ใน VRAM ตลอดเวลา ไม่ unload
 export BATCH_SIZE="${BATCH_SIZE:-25}"
 
-STAGE1_M="${STAGE1_MODEL:-scb10x/llama3.1-typhoon2-8b-instruct:latest}"
-STAGE2_M="${STAGE2_MODEL:-qwen2.5:14b-instruct-q5_K_M}"
+STAGE1_M="${STAGE1_MODEL:-scb10x/typhoon2.5-qwen3-30b-a3b:latest}"
+STAGE2_M="${STAGE2_MODEL:-none}"
 
 MODELS_TO_PULL=()
-if [ "$ROLE" = "step6" ] || [ "$ROLE" = "stage1" ]; then
+if [ "$STAGE2_M" = "none" ] || [ -z "$STAGE2_M" ] || [ "$ROLE" = "single_stage" ]; then
     echo "=========================================================="
-    echo "=== STARTING DEDICATED STEP 6 NODE (Typhoon 2 8B) ==="
+    echo "=== STARTING CENTRAL MASTER LLM NODE (Single-Stage Step 6) ==="
+    echo "=== Model: ${STAGE1_M} (Step 7 Decommissioned) ==="
+    echo "=== Parallel Batch Slots: ${OLLAMA_NUM_PARALLEL} | Batch Size: ${BATCH_SIZE} ==="
+    echo "=========================================================="
+    export OLLAMA_MAX_LOADED_MODELS=1
+    MODELS_TO_PULL=("$STAGE1_M")
+elif [ "$ROLE" = "step6" ] || [ "$ROLE" = "stage1" ]; then
+    echo "=========================================================="
+    echo "=== STARTING DEDICATED STEP 6 NODE (Typhoon 2.5 30B-A3B) ==="
     echo "=== Model: ${STAGE1_M} ==="
     echo "=========================================================="
     export OLLAMA_MAX_LOADED_MODELS=1

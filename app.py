@@ -894,6 +894,13 @@ def get_llm_endpoints() -> dict:
     _CACHED_LLM_ENDPOINTS_TIME = now
     return _CACHED_LLM_ENDPOINTS
 
+def get_step6_llm_url() -> str:
+    """Resolve active Tier 2 (Typhoon / Step 6) LLM URL, prioritizing stage1_llm_url."""
+    eps = get_llm_endpoints()
+    if eps.get("stage1_alive") and eps.get("stage1_llm_url"):
+        return eps["stage1_llm_url"]
+    return eps.get("stage2_llm_url") or eps.get("master_llm_url") or "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy"
+
 def get_master_llm_url() -> str:
     """Resolve active Master / Stage 2 LLM URL."""
     eps = get_llm_endpoints()
@@ -1020,7 +1027,7 @@ def _run_remote_master_llm_refinement(
     if not s2_url and eps.get("stage2_alive") and eps.get("stage2_llm_url"):
         s2_url = eps["stage2_llm_url"]
 
-    if s1_url and s2_url and s1_url != s2_url:
+    if s1_url and s2_url and s1_url != s2_url and s2_url.lower() not in ("disabled", "none", "off"):
         t_start = time.time()
         log_transcribe(f"[STEP 6-7 3-TIER DECOUPLED] Executing 3-Tier Pipeline (Step 6 @ {s1_url} -> Step 7 @ {s2_url})...")
         stage1_segments = list(segments)
@@ -1177,26 +1184,32 @@ def delegate_async_refine_to_master(
     orig_filename: str = "",
     duration: float = 0.0,
     processing_time_worker: float = 0.0,
-    model: str = "qwen2.5:32b",
-    batch_size: int = 60
+    model: str = "scb10x/llama3.1-typhoon2-8b-instruct:latest",
+    batch_size: int = 25
 ) -> bool:
     """
-    Hands off Step 5 Thai cues to Central Master LLM for asynchronous Step 6 refinement.
-    Master LLM accepts immediately (status: queued) and will send the final Step 6 WebVTT
-    directly to the Storage Server webhook_url once finished.
+    Hands off Step 5 Thai cues to Tier 2 (Typhoon Node) for asynchronous Step 6 refinement.
+    Typhoon Node refines the cues and then delegates to Tier 3 (Qwen Node) for Step 7 QC.
+    Finally, Qwen sends the completed WebVTT directly to Storage Server webhook_url.
     This frees the Worker GPU immediately!
     """
     if not segments or not webhook_url:
         return False
 
-    master_url = get_master_llm_url()
-    log_transcribe(f"[STEP 6 ASYNC HANDOFF] Delegating {len(segments)} Thai cues to Central Master LLM ({master_url}/v1/llm/refine_async)...")
+    eps = get_llm_endpoints()
+    step6_url = eps.get("stage1_llm_url") if (eps.get("stage1_alive") and eps.get("stage1_llm_url")) else None
+    fallback_url = eps.get("stage2_llm_url") or eps.get("master_llm_url")
 
-    endpoints = [f"{master_url}/v1/llm/refine_async"]
-    if "23.158.40.152" in master_url:
-        endpoints.append("http://162.200.81.25:64019/v1/llm/refine_async")
-    elif "162.200.81.25" in master_url:
-        endpoints.append("http://23.158.40.152/v1/llm/refine_async")
+    endpoints = []
+    if step6_url:
+        log_transcribe(f"[STEP 6 ASYNC HANDOFF] Delegating {len(segments)} Thai cues to Tier 2 Typhoon Node ({step6_url}/v1/llm/refine_async)...")
+        endpoints.append(f"{step6_url}/v1/llm/refine_async")
+        if fallback_url and fallback_url != step6_url:
+            endpoints.append(f"{fallback_url}/v1/llm/refine_async")
+    else:
+        target_url = fallback_url or "http://ph.cdnwatch.com/subtitle.php?action=llm_proxy"
+        log_transcribe(f"[STEP 6 ASYNC HANDOFF FALLBACK] Tier 2 Typhoon offline. Delegating directly to Tier 3 Qwen Node ({target_url}/v1/llm/refine_async)...")
+        endpoints.append(f"{target_url}/v1/llm/refine_async")
 
     payload_data = {
         "segments": segments,
@@ -1225,7 +1238,8 @@ def delegate_async_refine_to_master(
                 if resp.status in (200, 201, 202):
                     res_json = json.loads(resp.read().decode("utf-8"))
                     if res_json.get("status") == "queued":
-                        log_transcribe(f"[STEP 6 ASYNC SUCCESS] Central Master LLM acknowledged queued (custom_id: {custom_id}) via {endpoint}.")
+                        dest_label = "Tier 2 Typhoon" if (step6_url and step6_url in endpoint) else "Tier 3 Qwen"
+                        log_transcribe(f"[STEP 6 ASYNC SUCCESS] {dest_label} acknowledged queued (custom_id: {custom_id}) via {endpoint}.")
                         return True
         except Exception as ex:
             log_transcribe(f"[STEP 6 ASYNC NOTICE] Endpoint {endpoint} failed: {ex}. Trying next...")

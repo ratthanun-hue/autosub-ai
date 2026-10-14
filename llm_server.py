@@ -43,9 +43,10 @@ app = FastAPI(
 )
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-STAGE1_MODEL = os.environ.get("STAGE1_MODEL", "scb10x/llama3.1-typhoon2-8b-instruct:latest")
-STAGE2_MODEL = os.environ.get("STAGE2_MODEL", "qwen2.5:14b-instruct-q5_K_M")
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", STAGE2_MODEL)
+STAGE1_MODEL = os.environ.get("STAGE1_MODEL", "scb10x/typhoon2.5-qwen3-30b-a3b:latest")
+STAGE2_MODEL = os.environ.get("STAGE2_MODEL", "none")
+DISABLE_STEP7 = os.environ.get("DISABLE_STEP7", "1").strip().lower() in ("1", "true", "yes")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", STAGE1_MODEL)
 DEFAULT_ENGINE = os.environ.get("LLM_ENGINE", "ollama").strip().lower()
 DEFAULT_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 DEFAULT_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -119,6 +120,7 @@ class AsyncRefineRequest(BaseModel):
     filename: Optional[str] = None
     duration: Optional[float] = 0.0
     processing_time_worker: Optional[float] = 0.0
+    step6_done: Optional[bool] = False
 
 class TranslateRequest(BaseModel):
     segments: Optional[List[Dict[str, Any]]] = None
@@ -442,17 +444,24 @@ def health_check():
     with total_completed_lock:
         done_count = total_completed_jobs
     gpu_name, vram_gb = get_gpu_info()
+    node_role = os.environ.get("ROLE", "").strip().lower() or "master_llm"
+    pipeline_desc = (
+        f"Single-Stage Step 6 ({STAGE1_MODEL})"
+        if (STAGE2_MODEL in ("none", "", None) or DISABLE_STEP7)
+        else f"2-Stage Cascade (Step 6 {STAGE1_MODEL} + Step 7 {STAGE2_MODEL})"
+    )
     return {
         "status": "ok" if ollama_ok else "degraded",
         "service": "autosub-central-master-llm",
         "ollama_connected": ollama_ok,
         "ollama_url": OLLAMA_URL,
-        "pipeline": f"2-Stage Cascade (Step 6 {STAGE1_MODEL} + Step 7 {STAGE2_MODEL})",
-        "model": f"{STAGE1_MODEL} -> {STAGE2_MODEL}",
+        "pipeline": pipeline_desc,
+        "model": STAGE1_MODEL if (STAGE2_MODEL in ("none", "", None) or DISABLE_STEP7) else f"{STAGE1_MODEL} -> {STAGE2_MODEL}",
         "stage1_model": STAGE1_MODEL,
         "stage2_model": STAGE2_MODEL,
+        "step7_enabled": not (STAGE2_MODEL in ("none", "", None) or DISABLE_STEP7),
         "gpu": gpu_name,
-        "role": "master_llm",
+        "role": node_role,
         "vram_gb": vram_gb,
         "active_jobs": req_count,
         "jobs_completed": done_count,
@@ -705,6 +714,42 @@ def get_stage1_llm_url() -> str:
 
     return ""
 
+_CACHED_STAGE2_URL = None
+_CACHED_STAGE2_TIME = 0.0
+
+def get_stage2_llm_url() -> str:
+    """Resolve Tier 3 (Step 7) LLM endpoint URL from env or Storage Server."""
+    global _CACHED_STAGE2_URL, _CACHED_STAGE2_TIME
+    now = time.time()
+    if _CACHED_STAGE2_URL and (now - _CACHED_STAGE2_TIME < 60.0):
+        return _CACHED_STAGE2_URL
+
+    env_url = os.environ.get("STAGE2_LLM_URL", "").strip().rstrip("/")
+    if env_url:
+        _CACHED_STAGE2_URL = env_url
+        _CACHED_STAGE2_TIME = now
+        return env_url
+
+    storage_candidates = [
+        "http://ph.cdnwatch.com/subtitle.php?action=get_master_llm",
+        "http://23.158.40.152/subtitle.php?action=get_master_llm"
+    ]
+    for surl in storage_candidates:
+        try:
+            req = urllib.request.Request(surl, headers={"User-Agent": "AutoSub-Tier2-Probe"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    s2 = (data.get("stage2_llm_url") or data.get("master_llm_url") or "").strip().rstrip("/")
+                    if s2:
+                        _CACHED_STAGE2_URL = s2
+                        _CACHED_STAGE2_TIME = now
+                        return s2
+        except Exception:
+            pass
+
+    return ""
+
 def refine_subtitles_cascade(
     segments: List[Dict[str, Any]],
     drama_title: str = "ทั่วไป",
@@ -733,13 +778,15 @@ def refine_subtitles_cascade(
     char_str = ", ".join(known_chars[:15]) if known_chars else "ไม่ระบุ"
 
     typhoon_system_prompt = (
-        f"คุณคือ AI ผู้เชี่ยวชาญด้านภาษาไทยและบทละครโทรทัศน์ไทย (Thai Drama Colloquial Flow Refiner)\n"
+        f"คุณคือ AI ผู้เชี่ยวชาญระดับสูงด้านภาษาไทย บทละครโทรทัศน์ และการตรวจทานคำบรรยาย (Thai Drama Dialogue & Subtitle QC Specialist)\n"
         f"ข้อมูลละคร: เรื่อง '{drama_title}'\n"
         f"ตัวละครหลัก: {char_str}\n"
-        "หน้าที่: ตรวจสอบและเกลาบทสนทนาภาษาไทยจากระบบเสียงพูด (ASR) ให้ถูกต้องตามสำนวนไทยและบริบทละคร\n"
+        "หน้าที่ของคุณคือตรวจสอบและขัดเกลาบทสนทนาภาษาไทยจากระบบเสียงพูด (ASR) ให้ถูกต้อง สละสลวย และตรงบริบทละคร:\n"
         "1. แก้ไขคำเพี้ยน/คำพ้องเสียงและชื่อตัวละครตามบริบทละคร เช่น อาบดู -> แอบดู, ทามไม่ -> ทำไม, ชอบการ -> ชอบกัน, คะณชาติ -> คุณชาติ\n"
-        "2. ห้ามแต่งเติมบทใหม่ รักษาความหมายเดิม\n"
-        "3. ส่งผลลัพธ์เป็น JSON Object ที่มี key เป็น ID และ value เป็นประโยคที่เกลาแล้วทั้งหมด"
+        "2. ตรวจสอบการสะกดคำ คำสแลง และสำนวนไทยให้ถูกต้อง เช่น เวล่ำเวลา, กะตา -> กับตา, จิงๆ -> จริงๆ\n"
+        "3. ตรวจสอบการผันวรรณยุกต์ คะ/ค่ะ ให้ถูกต้องตามหลักภาษาและอารมณ์ของประโยค\n"
+        "4. ห้ามแต่งเติมบทใหม่ รักษาความหมายเดิมของตัวละคร 100%\n"
+        "5. ส่งผลลัพธ์เป็น JSON Object ที่มี key เป็น ID และ value เป็นประโยคที่เกลาแล้วทั้งหมดเท่านั้น"
     )
 
     qwen_system_prompt = (
@@ -817,6 +864,17 @@ def refine_subtitles_cascade(
             except Exception as err1:
                 logger.warning(f"Batch {i // batch_size + 1} Local Stage 1 ({m_s1}) warning: {err1}. Falling back directly to Stage 2.")
                 stage1_dict = orig_dict
+
+        # If Step 7 (Stage 2) is disabled or not configured, apply Step 6 results directly
+        if m_s2 in ("none", "", None) or DISABLE_STEP7:
+            for idx, s in enumerate(chunk, start=i):
+                sid = str(s.get("id", idx))
+                if sid in stage1_dict and isinstance(stage1_dict[sid], str) and stage1_dict[sid].strip():
+                    new_text = stage1_dict[sid].strip()
+                    if new_text and new_text != s.get("text", ""):
+                        s["text"] = new_text
+                        total_corrected += 1
+            continue
 
         # Stage 2: Qwen 2.5 14B Q6_K (Diff-Only Precision Subtitle QC)
         try:
@@ -1168,15 +1226,109 @@ def _process_async_refine(job: AsyncRefineRequest):
         else:
             batch_size = min(batch_size, 25)
 
-        refined_segments, total_corrected, dur = refine_subtitles_cascade(
-            segments=segments,
-            drama_title=drama_title,
-            known_chars=known_chars,
-            batch_size=batch_size
-        )
+        node_role = os.environ.get("ROLE", "").strip().lower()
+        is_step6_worker = (node_role in ("step6", "stage1")) or ("typhoon" in (STAGE1_MODEL or "").lower() and not job.step6_done and node_role not in ("step7", "stage2", "tier3_qc"))
 
-        total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
-        logger.info(f"[ASYNC SUCCESS] Refined {total_corrected} cues in {dur}s for custom_id='{custom_id}' (Total time: {total_proc}s). Delivering webhook...")
+        # ==============================================================
+        # 1. TIER 2 TYPHOON NODE: Run Step 6 -> Chained Handoff to Tier 3 Qwen
+        # ==============================================================
+        if is_step6_worker and not job.step6_done:
+            logger.info(f"[ASYNC STEP 6 TYPHOON START] Running Thai Colloquial Flow for custom_id='{custom_id}', cues={len(segments)}...")
+            refined_segments, dur = refine_subtitles_stage1_only(
+                segments=segments,
+                drama_title=drama_title,
+                known_chars=known_chars,
+                batch_size=batch_size,
+                model=STAGE1_MODEL
+            )
+            total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
+            logger.info(f"[ASYNC STEP 6 TYPHOON DONE] Refined {len(refined_segments)} cues in {dur}s for custom_id='{custom_id}'.")
+
+            if DISABLE_STEP7 or STAGE2_MODEL in ("none", "", None):
+                # Step 7 is disabled. Deliver Step 6 results directly to webhook!
+                logger.info(f"[ASYNC STEP 6 DIRECT DELIVERY] Step 7 disabled. Delivering Single-Stage Step 6 cues directly to webhook for custom_id='{custom_id}'...")
+                total_corrected = len(refined_segments)
+                pipeline_name = f"Single-Stage Step 6 ({STAGE1_MODEL})"
+                handoff_success = False
+                s2_url = None
+            else:
+                # Attempt Chained Handoff to Tier 3 (Step 7 Qwen Node)
+                s2_url = get_stage2_llm_url()
+                handoff_success = False
+            if s2_url and "127.0.0.1" not in s2_url and "localhost" not in s2_url:
+                try:
+                    s2_payload = {
+                        "segments": refined_segments,
+                        "drama_title": drama_title,
+                        "known_chars": known_chars,
+                        "batch_size": batch_size,
+                        "stage1_model": STAGE1_MODEL,
+                        "stage2_model": STAGE2_MODEL,
+                        "webhook_url": job.webhook_url,
+                        "webhook_secret": job.webhook_secret,
+                        "token": job.token or job.webhook_secret,
+                        "custom_id": custom_id,
+                        "filename": job.filename,
+                        "duration": job.duration,
+                        "processing_time_worker": total_proc,
+                        "step6_done": True
+                    }
+                    req_s2 = urllib.request.Request(
+                        f"{s2_url}/v1/llm/refine_async",
+                        data=json.dumps(s2_payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-Tier2-TyphoonNode"}
+                    )
+                    with urllib.request.urlopen(req_s2, timeout=15.0) as resp_s2:
+                        if resp_s2.status in (200, 201, 202):
+                            r_json_s2 = json.loads(resp_s2.read().decode("utf-8"))
+                            if r_json_s2.get("status") == "queued":
+                                logger.info(f"[ASYNC CHAINED HANDOFF SUCCESS] Step 6 finished in {dur}s. Delegated {len(refined_segments)} cues to Tier 3 Qwen Node ({s2_url}/v1/llm/refine_async) for Step 7 QC (custom_id: {custom_id}). Typhoon GPU freed!")
+                                handoff_success = True
+                except Exception as ex_s2:
+                    logger.warning(f"[ASYNC CHAINED HANDOFF WARN] Failed to delegate to Qwen Node ({s2_url}): {ex_s2}. Delivering Step 6 results directly to webhook.")
+
+            if handoff_success:
+                with total_completed_lock:
+                    total_completed_jobs += 1
+                return
+
+            # Fallback: Deliver Step 6 directly if Tier 3 is offline or handoff failed
+            logger.info(f"[ASYNC STEP 6 FALLBACK DELIVERY] Tier 3 unavailable. Delivering Step 6 cues directly to webhook for custom_id='{custom_id}'...")
+            total_corrected = len(refined_segments)
+            pipeline_name = "Tier 2 Typhoon (Step 6 Direct Fallback)"
+
+        # ==============================================================
+        # 2. TIER 3 QWEN NODE: Run Step 7 Precision QC & Diff Extractor
+        # ==============================================================
+        elif (node_role in ("step7", "stage2", "tier3_qc")) or job.step6_done:
+            logger.info(f"[ASYNC STEP 7 QWEN START] Running Precision Subtitle QC for custom_id='{custom_id}', cues={len(segments)} (from Step 6: {job.step6_done})...")
+            refined_segments, total_corrected, dur = refine_subtitles_stage2_only(
+                segments=segments,
+                drama_title=drama_title,
+                known_chars=known_chars,
+                batch_size=batch_size,
+                model=STAGE2_MODEL
+            )
+            total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
+            pipeline_name = "3-Tier SOTA (Step 6 Typhoon + Step 7 Qwen QC)" if job.step6_done else "Tier 3 Qwen Precision QC"
+            logger.info(f"[ASYNC STEP 7 QWEN SUCCESS] Refined {total_corrected} cues in {dur}s for custom_id='{custom_id}' (Total time: {total_proc}s). Delivering webhook...")
+
+        # ==============================================================
+        # 3. SINGLE MASTER NODE: 2-Stage Cascade on Single Node
+        # ==============================================================
+        else:
+            refined_segments, total_corrected, dur = refine_segments_cascade(
+                segments=segments,
+                drama_title=drama_title,
+                known_chars=known_chars,
+                batch_size=batch_size
+            )
+            total_proc = round((job.processing_time_worker or 0.0) + dur, 2)
+            if STAGE2_MODEL in ("none", "", None) or DISABLE_STEP7:
+                pipeline_name = f"Single-Stage Step 6 ({STAGE1_MODEL})"
+            else:
+                pipeline_name = f"2-Stage Cascade (Step 6 {STAGE1_MODEL} + Step 7 {STAGE2_MODEL})"
+            logger.info(f"[ASYNC REFINEMENT SUCCESS] Refined {total_corrected} cues in {dur}s for custom_id='{custom_id}' (Total time: {total_proc}s). Delivering webhook...")
 
         # Format VTT
         vtt_lines = ["WEBVTT\n"]
@@ -1217,7 +1369,7 @@ def _process_async_refine(job: AsyncRefineRequest):
             "segments": refined_segments,
             "step6_refined": True,
             "corrected_count": total_corrected,
-            "pipeline": "2-Stage Cascade (Typhoon 2 8B + Qwen 14B Q8)"
+            "pipeline": pipeline_name
         }
         send_webhook_callback(job.webhook_url, webhook_payload)
 
