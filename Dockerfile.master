@@ -36,6 +36,12 @@ RUN pip3 install --no-cache-dir \
     pydantic \
     requests
 
+# Pre-bake Typhoon 2.5 30B MoE Model directly into Ollama cache (Eliminates runtime download penalty)
+RUN (ollama serve > /dev/null 2>&1 &) && \
+    sleep 5 && \
+    ollama pull scb10x/typhoon2.5-qwen3-30b-a3b:latest && \
+    pkill -f ollama
+
 # จัดการพื้นที่ทำงานและคัดลอกไฟล์ Server
 WORKDIR /root/whisper-server
 

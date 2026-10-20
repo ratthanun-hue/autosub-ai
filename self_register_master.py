@@ -89,31 +89,14 @@ if not inst_id:
 
 log(f"Detected Master Instance ID: {inst_id}")
 
-# 1. Wait for local Ollama & Master LLM service on port 10200
-log("Step 1: Waiting for local Master LLM service to be ready on port 10200...")
-local_ready = False
-for attempt in range(60):  # up to 3 minutes
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:10200/health", timeout=3) as r:
-            if r.status == 200:
-                local_ready = True
-                log("Local Master LLM service (port 10200) is READY!")
-                break
-    except Exception:
-        pass
-    time.sleep(3)
-
-if not local_ready:
-    log("WARNING: Local Master LLM did not respond within 180s, proceeding to network discovery...")
-
-# 2. Discover Public IP and Mapped Port for 10200/tcp
-log("Step 2: Discovering external IP and port mappings from Vast.ai API...")
+# 1. Discover Public IP and Mapped Port from Vast.ai API (Immediate Discovery)
+log("Step 1: Discovering external IP and port mappings from Vast.ai API...")
 public_ip = os.environ.get("PUBLIC_IP")
 master_port = os.environ.get("MASTER_PORT")
-gpu_name = "NVIDIA RTX A4000"
+gpu_name = "Tesla V100"
 
 if not public_ip or not master_port:
-    for attempt in range(30):
+    for attempt in range(40):
         try:
             if not VAST_API_KEY:
                 log("No VAST_API_KEY found, check environment or /root/.vast_api_key")
@@ -132,13 +115,12 @@ if not public_ip or not master_port:
             if target_inst:
                 public_ip = target_inst.get("public_ipaddr")
                 ports = target_inst.get("ports", {})
-                gpu_name = target_inst.get("gpu_name", "NVIDIA RTX A4000")
+                gpu_name = target_inst.get("gpu_name", "Tesla V100")
 
-                # Look for mapped 10200/tcp
+                # Look for mapped 10200/tcp or 10100/tcp
                 if "10200/tcp" in ports and len(ports["10200/tcp"]) > 0:
                     master_port = ports["10200/tcp"][0].get("HostPort")
                 elif "10100/tcp" in ports and len(ports["10100/tcp"]) > 0:
-                    # Fallback if unified single port
                     master_port = ports["10100/tcp"][0].get("HostPort")
 
                 if public_ip and master_port:
@@ -157,8 +139,8 @@ if not public_ip or not master_port:
     log("FAILED: Could not discover external IP/Port within timeout.")
     sys.exit(1)
 
-# 3. Post registration payload to Storage Server
-def send_registration():
+# 2. Registration Function with Status Support
+def send_registration(status="active"):
     urls_to_try = [
         STORAGE_REGISTER_URL,
         "http://23.158.40.152/subtitle.php?action=register_master_llm"
@@ -167,8 +149,9 @@ def send_registration():
         "ip": public_ip,
         "port": str(master_port),
         "id": str(inst_id),
-        "role": os.environ.get("ROLE", ""),
-        "model": os.environ.get("OLLAMA_MODEL", "Typhoon2-8B + Qwen14B-Q8 Cascade"),
+        "role": os.environ.get("ROLE", "master_llm"),
+        "model": os.environ.get("OLLAMA_MODEL", "scb10x/typhoon2.5-qwen3-30b-a3b:latest"),
+        "status": status,
         "token": MASTER_AUTH_TOKEN
     }
     post_data = urllib.parse.urlencode(payload).encode("utf-8")
@@ -182,21 +165,21 @@ def send_registration():
             )
             with urllib.request.urlopen(req_reg, timeout=10) as resp:
                 resp_body = resp.read().decode()
-                log(f"Registration response ({reg_url}): {resp.status} - {resp_body}")
+                log(f"Registration response ({status}) ({reg_url}): {resp.status} - {resp_body}")
                 return resp.status == 200
         except Exception as e:
             log(f"Registration attempt to {reg_url} failed: {e}")
     return False
 
-log(f"Step 3: Registering Master Node at {STORAGE_REGISTER_URL}...")
-registered = send_registration()
+# Send initial pre-registration (status: provisioning) so Storage knows Master is booting
+log("Step 2: Sending initial Provisioning registration to Storage Server...")
+send_registration(status="provisioning")
 
-# 4. Continuous Heartbeat Loop
-log("Step 4: Entering Heartbeat loop (every 30s)...")
+# 3. Continuous Heartbeat Loop (monitors port 10200 /health)
+log("Step 3: Entering Heartbeat loop (every 30s)...")
 while True:
     time.sleep(30)
     try:
-        # Check if local Master service is still alive on 127.0.0.1
         is_healthy = False
         try:
             with urllib.request.urlopen("http://127.0.0.1:10200/health", timeout=3) as r:
@@ -204,9 +187,7 @@ while True:
         except Exception:
             is_healthy = False
 
-        if is_healthy:
-            send_registration()
-        else:
-            log("WARN: Local Master LLM on 127.0.0.1:10200 not responding, skipping heartbeat this cycle")
+        current_status = "active" if is_healthy else "provisioning"
+        send_registration(status=current_status)
     except Exception as e:
         log(f"Heartbeat loop exception: {e}")

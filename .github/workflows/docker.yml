@@ -124,10 +124,10 @@ jobs:
             ghcr.io/${{ env.OWNER_LC }}/autosub-qwen:${{ github.sha }}
 
   # ========================================================
-  # 4. Build Unified Master LLM (2-Stage Cascade / Legacy)
+  # 4. Build Unified Master LLM (Pre-baked Typhoon 2.5 30B MoE)
   # ========================================================
   build-master:
-    name: Build & Push Master LLM (Cascade)
+    name: Build & Push Master LLM (Pre-baked Typhoon 30B)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,6 +136,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Free Disk Space for 18.5GB LLM Layer
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -a -f || true
+          echo "=== Disk space after cleanup ==="
+          df -h
 
       - name: Lowercase repository owner
         run: echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
@@ -160,4 +172,5 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.OWNER_LC }}/autosub-master:latest
+            ghcr.io/${{ env.OWNER_LC }}/autosub-master:baked
             ghcr.io/${{ env.OWNER_LC }}/autosub-master:${{ github.sha }}
