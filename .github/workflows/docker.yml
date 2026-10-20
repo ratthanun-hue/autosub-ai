@@ -20,6 +20,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free Disk Space for Pre-baked Audio Models
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -a -f || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
       - name: Lowercase repository owner
         run: echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
         env:
@@ -43,6 +55,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.OWNER_LC }}/autosub-worker:latest
+            ghcr.io/${{ env.OWNER_LC }}/autosub-worker:baked
             ghcr.io/${{ env.OWNER_LC }}/autosub-worker:${{ github.sha }}
 
   # ========================================================

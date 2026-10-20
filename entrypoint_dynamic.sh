@@ -24,6 +24,10 @@ if [ ! -f "/root/.cache/torch/hub/torchaudio/models/hdemucs_high_trained.pt" ]; 
     
     rm -rf /tmp/r2_models
     echo "Audio models ready!"
+else
+    echo "=========================================================="
+    echo "=== PRE-BAKED AUDIO MODELS DETECTED: Skipping R2 download! ==="
+    echo "=========================================================="
 fi
 
 # ซิงค์ symlink ให้รองรับทั้ง /root/.cache และ /workspace/.hf_home
