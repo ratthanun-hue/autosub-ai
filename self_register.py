@@ -73,7 +73,7 @@ log(f"Detected Instance ID: {inst_id}")
 # 1. Wait for local whisper service to respond on http://localhost:10100/health
 log("Step 1: Waiting for local Whisper service to be ready on port 10100...")
 local_ready = False
-for attempt in range(40):
+for attempt in range(300):
     try:
         with urllib.request.urlopen("http://localhost:10100/health", timeout=3) as r:
             if r.status == 200:
@@ -85,7 +85,8 @@ for attempt in range(40):
     time.sleep(3)
 
 if not local_ready:
-    log("WARNING: Local service did not become healthy within 120s, proceeding anyway...")
+    log("FATAL: Local service did not become healthy within timeout. Aborting registration!")
+    exit(1)
 
 # 2. Query Vast.ai API to discover external IP and mapped port for 10100/tcp
 log("Step 2: Discovering external IP and port mappings from Vast.ai API...")
