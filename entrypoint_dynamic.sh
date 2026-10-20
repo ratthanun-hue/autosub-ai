@@ -43,6 +43,12 @@ cd /root/whisper-server
 PYTHON_BIN=$(which python3 || which python || echo "/opt/conda/bin/python")
 UVICORN_BIN=$(which uvicorn || echo "/opt/conda/bin/uvicorn")
 
+# 3.5 ป้องกันปัญหา Transformers 5.x ไม่รองรับ PyTorch < 2.6
+if $PYTHON_BIN -c "import transformers; exit(0 if int(transformers.__version__.split('.')[0]) >= 5 else 1)" 2>/dev/null; then
+    echo "[COMPAT] Transformers 5.x detected with PyTorch 2.5! Downgrading to transformers<5.0.0..."
+    pip install --no-cache-dir "transformers<5.0.0"
+fi
+
 # 4. เริ่มต้นสคริปต์ Self-Registration สำหรับ Dynamic Worker ในเบื้องหลัง
 if [ -f "/root/whisper-server/self_register.py" ]; then
     echo "Starting Dynamic Node Auto-Registration daemon in background..."

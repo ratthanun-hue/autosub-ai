@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ติดตั้งแพ็กเกจสำหรับถอดเสียงภาษาไทยและ Dual Engine
 RUN pip install --no-cache-dir \
     faster-whisper \
-    transformers \
+    "transformers<5.0.0" \
     pythainlp \
     torchaudio \
     demucs \
