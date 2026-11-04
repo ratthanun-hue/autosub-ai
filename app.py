@@ -1652,6 +1652,7 @@ def transcribe_with_large_v3_thai(
     temperature: float = 0.0,
     time_offset: float = 0.0,
     isolate_vocals: bool = True,
+    hotwords: Optional[str] = None,
 ):
     """
     End-to-End Thai Transcription & Alignment via Whisper large-v3 (32-Decoder Layers):
@@ -1712,6 +1713,7 @@ def transcribe_with_large_v3_thai(
             beam_size=5,
             word_timestamps=True,
             initial_prompt=initial_prompt,
+            hotwords=hotwords,
             condition_on_previous_text=False,
             repetition_penalty=1.15,
             no_speech_threshold=0.6,
@@ -1794,6 +1796,7 @@ def transcribe_hybrid_thai(
     temperature: float = 0.0,
     time_offset: float = 0.0,
     isolate_vocals: bool = True,
+    hotwords: Optional[str] = None,
 ):
     """
     Hybrid SOTA Pipeline:
@@ -1860,6 +1863,7 @@ def transcribe_hybrid_thai(
             beam_size=5,
             word_timestamps=True,
             initial_prompt=initial_prompt,
+            hotwords=hotwords,
             condition_on_previous_text=False,
             repetition_penalty=1.15,
             no_speech_threshold=0.6,
@@ -2045,7 +2049,8 @@ def transcribe_multilingual(
     initial_prompt: Optional[str] = None,
     temperature: float = 0.0,
     time_offset: float = 0.0,
-    isolate_vocals: bool = False
+    isolate_vocals: bool = False,
+    hotwords: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], str, float]:
     global whisper_model
     if whisper_model is None:
@@ -2093,6 +2098,7 @@ def transcribe_multilingual(
             beam_size=5,
             word_timestamps=True,
             initial_prompt=initial_prompt,
+            hotwords=hotwords,
             condition_on_previous_text=False,
             repetition_penalty=1.15,
             no_speech_threshold=0.6,
@@ -2309,6 +2315,18 @@ def send_webhook_callback(url: str, payload: dict, retries: int = 3, delay: floa
         log_transcribe(f"[WEBHOOK FATAL] {e}")
     return False
 
+def parse_bool_flag(val: Any, default: bool = True) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("false", "0", "no", "off"):
+        return False
+    if s in ("true", "1", "yes", "on"):
+        return True
+    return default
+
 def do_transcription_pipeline(
     tmp_path: str,
     orig_filename: str,
@@ -2327,7 +2345,8 @@ def do_transcription_pipeline(
     hf_token: Optional[str] = None,
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
-    refine_llm: Optional[bool] = True
+    refine_llm: Optional[Any] = True,
+    hotwords: Optional[str] = None
 ):
     raw_lang = (language or "th").strip().lower()
     if raw_lang in ["zh", "cn", "chinese"]:
@@ -2349,7 +2368,8 @@ def do_transcription_pipeline(
             initial_prompt=prompt,
             temperature=temperature or 0.0,
             time_offset=offset_val,
-            isolate_vocals=bool(isolate_vocals)
+            isolate_vocals=bool(isolate_vocals),
+            hotwords=hotwords
         )
         detected_lang = lang_code
     elif req_model in ["typhoon", "typhoon-ctc"]:
@@ -2366,7 +2386,8 @@ def do_transcription_pipeline(
             initial_prompt=initial_prompt,
             temperature=temperature,
             time_offset=offset_val,
-            isolate_vocals=bool(isolate_vocals)
+            isolate_vocals=bool(isolate_vocals),
+            hotwords=hotwords
         )
         detected_lang = "th"
     else:
@@ -2379,7 +2400,8 @@ def do_transcription_pipeline(
             initial_prompt=initial_prompt,
             temperature=temperature,
             time_offset=offset_val,
-            isolate_vocals=bool(isolate_vocals)
+            isolate_vocals=bool(isolate_vocals),
+            hotwords=hotwords
         )
         if drama_title and str(drama_title).strip():
             d_clean = str(drama_title).strip()
@@ -2416,7 +2438,8 @@ def do_transcription_pipeline(
         log_transcribe(f"[STEP 5 DICTIONARY] Applied 1,077 Thai rules across {len(segments)} cues ({step5_corrections} cues modified)")
 
     # Step 6: Contextual Refinement via Fast Local/Remote LLM (Synchronous fallback)
-    if refine_llm and segments:
+    should_refine_step6 = parse_bool_flag(refine_llm, default=True)
+    if should_refine_step6 and segments:
         try:
             if not known_chars and drama_title:
                 known_chars = get_known_characters(drama_title)
@@ -2496,7 +2519,8 @@ def async_webhook_worker(
     hf_token: Optional[str] = None,
     drama_title: Optional[str] = None,
     known_chars: Optional[List[str]] = None,
-    refine_llm: Optional[bool] = True
+    refine_llm: Optional[Any] = True,
+    hotwords: Optional[str] = None
 ):
     global active_jobs, total_jobs_completed, last_active_time
     token = current_file_ctx.set(orig_filename)
@@ -2507,14 +2531,15 @@ def async_webhook_worker(
                 tmp_path, orig_filename, model_name, language or "th", "verbose_json",
                 temperature, prompt, isolate_vocals, time_offset, start_ts, file_size_mb,
                 diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
-                drama_title=drama_title, known_chars=known_chars, refine_llm=False
+                drama_title=drama_title, known_chars=known_chars, refine_llm=False, hotwords=hotwords
             )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         if isinstance(res, dict) and res.get("segments"):
             # Step 6: Async Webhook handoff to Central Master LLM (Thai only)
             is_thai = (language or "th").strip().lower() in ["th", "thai", "t1"]
-            if refine_llm and is_thai:
+            should_refine_step6 = parse_bool_flag(refine_llm, default=True)
+            if should_refine_step6 and is_thai:
                 if check_ollama_available():
                     try:
                         refined_cues, num_corr, llm_secs = _run_local_ollama_refinement(
@@ -2582,7 +2607,7 @@ def async_webhook_worker(
                 "vtt": vtt_out,
                 "srt": srt_out,
                 "segments": res.get("segments", []),
-                "step6_refined": True if (refine_llm and is_thai) else False
+                "step6_refined": True if (should_refine_step6 and is_thai) else False
             }
             send_webhook_callback(webhook_url, payload)
     except Exception as e:
@@ -2699,11 +2724,13 @@ def api_llm_refine(req: RefineSubtitlesRequest):
 @app.post("/v1/audio/transcriptions")
 def transcribe(
     file: UploadFile = File(...),
+    plan: Optional[str] = Form(None),
     model_name: Optional[str] = Form("auto", alias="model"),
     language: Optional[str] = Form("th"),
     response_format: Optional[str] = Form("verbose_json"),
     temperature: Optional[float] = Form(0.0),
     prompt: Optional[str] = Form(None),
+    hotwords: Optional[str] = Form(None),
     drama_title: Optional[str] = Form(None),
     characters: Optional[str] = Form(None),
     isolate_vocals: Optional[bool] = Form(True),
@@ -2715,12 +2742,57 @@ def transcribe(
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
     custom_id: Optional[str] = Form(None),
-    refine_llm: Optional[bool] = Form(True),
+    refine_llm: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None
 ):
     global active_jobs, total_jobs_completed, last_active_time
     start_ts = time.time()
     orig_filename = os.path.basename(file.filename or "audio.mp3")
+
+    # -------------------------------------------------------------
+    # Plan Dispatcher & Commercial Security Gate
+    # -------------------------------------------------------------
+    plan_key = str(plan or "").strip().lower()
+    is_internal = (webhook_secret == "autosub_sec_webhook_2026_9a8b7c")
+
+    if plan_key in ["1", "plan1", "cleanvoice", "clean_voice"]:
+        # Plan 1: AutoSub CleanVoice™ (HDemucs v4 + Whisper large-v3 base)
+        model_name = "large-v3-thai"
+        isolate_vocals = True
+        should_refine_step6 = False
+        plan_label = "AutoSub CleanVoice™ (Plan 1)"
+    elif plan_key in ["2", "plan2", "lipsync_pro", "lipsync"]:
+        # Plan 2: AutoSub LipSync Pro™ (Whisper large-v3 + Typhoon CTC 20ms + Trie + Regex)
+        model_name = "hybrid"
+        isolate_vocals = bool(isolate_vocals) if isolate_vocals is not None else False
+        should_refine_step6 = False
+        plan_label = "AutoSub LipSync Pro™ (Plan 2)"
+    elif plan_key in ["3", "plan3", "studio_masterpiece", "masterpiece", "studio"]:
+        # Plan 3: AutoSub Studio Masterpiece™ (Full SOTA Stack + Typhoon 2.5 30B MoE)
+        model_name = "hybrid"
+        isolate_vocals = bool(isolate_vocals) if isolate_vocals is not None else True
+        should_refine_step6 = True
+        plan_label = "AutoSub Studio Masterpiece™ (Plan 3)"
+    else:
+        # Fallback เมื่อไม่ระบุ plan:
+        if is_internal:
+            # ระบบภายใน Vidio: คงค่าเดิมตามที่ส่งมา (Default: Studio Masterpiece)
+            model_name = model_name or "hybrid"
+            isolate_vocals = True if isolate_vocals is None else bool(isolate_vocals)
+            should_refine_step6 = parse_bool_flag(refine_llm, default=True)
+            plan_label = "Internal Vidio Dedicated (Plan 3 Equivalent)"
+        else:
+            # 🛡️ ลูกค้าภายนอก: บังคับใช้ Least-Privilege (Plan 1) และตัดสิทธิ์ Master LLM 100%!
+            model_name = "large-v3-thai"
+            isolate_vocals = True
+            should_refine_step6 = False
+            plan_label = "AutoSub CleanVoice™ (Default Plan 1 - Least-Privilege)"
+
+    # Anti-Tampering Override: หากไม่ใช่ Plan 3 ที่ได้รับสิทธิ์ ห้ามเรียกใช้ Master LLM เด็ดขาด
+    if not (plan_key in ["3", "plan3", "studio_masterpiece", "masterpiece", "studio"] or is_internal):
+        should_refine_step6 = False
+
+    log_transcribe(f"[PLAN ROUTED] {plan_label} | Internal: {is_internal} | Refine LLM: {should_refine_step6}")
 
     # 1. Clean drama title or extract from filename
     title_clean = ""
@@ -2774,6 +2846,16 @@ def transcribe(
 
     full_prompt = " ".join(prompt_parts) if prompt_parts else None
 
+    # Dynamic Hotwords compilation
+    effective_hotwords = hotwords.strip() if hotwords and hotwords.strip() else ""
+    if known_chars:
+        char_hotwords = ", ".join(known_chars[:25])
+        if effective_hotwords:
+            effective_hotwords = f"{effective_hotwords}, {char_hotwords}"
+        else:
+            effective_hotwords = char_hotwords
+    hotwords_param = effective_hotwords if effective_hotwords else None
+
     # Read uploaded file content to temporary file
     suffix = os.path.splitext(orig_filename)[1] or ".mp3"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -2796,7 +2878,7 @@ def transcribe(
             temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
             webhook_url, webhook_secret, custom_id,
             diarize, min_speakers, max_speakers, hf_token,
-            title_clean, known_chars, refine_llm
+            title_clean, known_chars, should_refine_step6, hotwords_param
         )
         return {
             "status": "queued",
@@ -2817,7 +2899,7 @@ def transcribe(
                 tmp_path, orig_filename, model_name, language, response_format,
                 temperature, full_prompt, isolate_vocals, offset_val, start_ts, file_size_mb,
                 diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers, hf_token=hf_token,
-                drama_title=title_clean, known_chars=known_chars, refine_llm=refine_llm
+                drama_title=title_clean, known_chars=known_chars, refine_llm=should_refine_step6, hotwords=hotwords_param
             )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
