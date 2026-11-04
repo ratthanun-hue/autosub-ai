@@ -599,6 +599,7 @@ if not SLANG_WORDS:
 # PERSISTENT DRAMA CHARACTER KNOWLEDGE BASE
 # ==========================================
 DRAMA_KNOWLEDGE_PATH = os.path.join(os.path.dirname(__file__), "drama_character_knowledge.json")
+MASTER_VOCAB_PATH = os.path.join(os.path.dirname(__file__), "master_vocabulary.json")
 DRAMA_KNOWLEDGE: Dict[str, dict] = {}
 DRAMA_VOCABULARY: set = set()
 
@@ -612,12 +613,54 @@ if os.path.exists(DRAMA_KNOWLEDGE_PATH):
     except Exception as _e:
         logging.warning(f"Could not load drama knowledge: {_e}")
 
+if os.path.exists(MASTER_VOCAB_PATH):
+    try:
+        with open(MASTER_VOCAB_PATH, "r", encoding="utf-8") as _f:
+            _mv_data = json.load(_f)
+            _mv_words = [item.get("word") for item in _mv_data.get("words", []) if item.get("word")]
+            DRAMA_VOCABULARY.update(_mv_words)
+            print(f"Loaded Master Vocabulary: {len(_mv_words)} words from master_vocabulary.json into PyThaiNLP!")
+    except Exception as _e:
+        logging.warning(f"Could not load master vocabulary: {_e}")
+
 GLOBAL_VOCAB_SET = set(thai_words()).union(set(SLANG_WORDS)).union(DRAMA_VOCABULARY)
 try:
     CUSTOM_TRIE = Trie(GLOBAL_VOCAB_SET)
 except Exception as _e:
     logging.warning(f"Could not build Trie with thai_words: {_e}")
     CUSTOM_TRIE = Trie(set(SLANG_WORDS).union(DRAMA_VOCABULARY))
+
+def _sync_learned_vocab_to_storage(drama_title: str, words: List[str], category: str = "character"):
+    """
+    Background worker callback to persist learned vocabulary back to Storage 17 Tier 2 Hub,
+    which asynchronously flushes to Origin Tier 1 MariaDB.
+    """
+    if not words:
+        return
+    try:
+        payload = json.dumps({
+            "token": "autosub_sec_webhook_2026_9a8b7c",
+            "drama_title": drama_title,
+            "category": category,
+            "words": words
+        }, ensure_ascii=False).encode("utf-8")
+
+        urls = [
+            ("http://ph.cdnwatch.com/subtitle.php?action=learn_vocab", {"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-Worker/3.0"}),
+            ("http://23.158.40.152/subtitle.php?action=learn_vocab", {"Content-Type": "application/json; charset=utf-8", "Host": "pl.cdnwatch.com", "User-Agent": "AutoSub-Worker/3.0"})
+        ]
+
+        for target_url, headers in urls:
+            try:
+                req = urllib.request.Request(target_url, data=payload, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    res_body = resp.read().decode("utf-8", errors="replace")
+                    log_transcribe(f"[AUTO-LEARN SYNC] Synced {len(words)} words for '{drama_title}' to Storage 17: {res_body[:100]}")
+                    return
+            except Exception as _e:
+                continue
+    except Exception as _outer_e:
+        log_transcribe(f"[AUTO-LEARN SYNC WARN] Failed to sync vocab to storage: {_outer_e}")
 
 def learn_drama_characters(drama_title: str, characters: Union[str, List[str]], actors: Optional[Union[str, List[str]]] = None) -> int:
     """
@@ -681,6 +724,16 @@ def learn_drama_characters(drama_title: str, characters: Union[str, List[str]], 
                 }, _f, ensure_ascii=False, indent=2)
         except Exception as _e:
             log_transcribe(f"[AUTO-LEARN WARN] ไม่สามารถบันทึก drama_character_knowledge.json: {_e}")
+
+        # Asynchronously sync learned vocabulary back to Storage 17 Tier 2 Hub
+        try:
+            threading.Thread(
+                target=_sync_learned_vocab_to_storage,
+                args=(clean_title, list(new_words), "character"),
+                daemon=True
+            ).start()
+        except Exception as _sync_err:
+            log_transcribe(f"[AUTO-LEARN WARN] Failed to spawn sync thread: {_sync_err}")
 
     return len(new_words)
 
