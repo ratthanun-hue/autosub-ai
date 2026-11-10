@@ -930,6 +930,151 @@ def refine_subtitles_cascade(
     return refined_segments, total_corrected, dur
 
 # ==============================================================================
+# OPTION B: ASYNCHRONOUS EPISODE-LEVEL VOCABULARY MINING (Auto-Learning Step 6)
+# ==============================================================================
+THAI_STOPWORDS = {
+    "การ", "ความ", "อย่าง", "และ", "หรือ", "ถ้า", "แต่", "เพราะ", "เพื่อ", "ว่า",
+    "นี้", "นั้น", "ไหน", "อะไร", "ใคร", "ที่", "ซึ่ง", "อัน", "ไป", "มา", "กิน",
+    "นอน", "นั่ง", "ยืน", "พูด", "บอก", "คิด", "รู้", "เห็น", "ได้", "ให้", "เป็น",
+    "อยู่", "คือ", "มี", "ทำ", "จะ", "ต้อง", "ควร", "น่า", "อาจ", "คง", "ไม่",
+    "มิ", "อย่า", "เลย", "จริง", "มาก", "น้อย", "เกิน", "ด้วย", "กัน", "จาก", "ถึง",
+    "โดย", "ตาม", "ครับ", "ค่ะ", "นะคะ", "นะคับ", "นะจ๊ะ", "จ้ะ", "จ้า", "ครับผม",
+    "ขอบคุณ", "ขอโทษ", "สวัสดี", "พวกเรา", "เธอ", "ฉัน", "ผม", "เขา", "มัน", "คุณ",
+    "ท่าน", "เรา", "พี่", "น้อง", "แม่", "พ่อ", "ลูก", "วัน", "เวลา", "ตอน", "เรื่อง",
+    "คน", "สิ่ง", "ของ", "ตัว", "อันนี้", "ที่นี่", "ที่นั่น", "ตรงนี้", "ตรงนั้น", "ทั้งหมด"
+}
+
+def _mine_vocab_worker(drama_title: str, segments: List[dict]):
+    """
+    Background worker: mines unique Thai colloquialisms, slang, and drama vocabulary
+    from the episode dialogue using the resident Ollama model (Single-Stage Step 6).
+    Sends high-confidence words to Storage 17 Tier 2 Hub.
+    """
+    try:
+        if not segments or not drama_title:
+            return
+
+        texts = [s.get("text", "").strip() for s in segments if s.get("text")]
+        full_text = " ".join(texts)
+        if len(full_text) < 50:
+            return
+
+        if len(full_text) > 6000:
+            part_len = 1800
+            mid = len(full_text) // 2
+            sampled_text = (
+                full_text[:part_len] + "\n...\n" +
+                full_text[mid - part_len//2 : mid + part_len//2] + "\n...\n" +
+                full_text[-part_len:]
+            )
+        else:
+            sampled_text = full_text
+
+        mining_prompt = (
+            "คุณคือ AI ผู้เชี่ยวชาญด้านภาษาไทยและคลังคำศัพท์ละครโทรทัศน์ไทย (Thai Drama Lexicographer)\n"
+            "หน้าที่: สกัดคำศัพท์ภาษาไทยที่น่าสนใจจากบทสนทนานี้เพื่อนำไปเพิ่มลงในพจนานุกรมตัดคำและคลังความรู้\n"
+            "หมวดหมู่คำที่ต้องการ:\n"
+            "- 'slang': คำสแลง, ภาษาปาก, ศัพท์วัยรุ่น, คำอุทานเฉพาะ, คำทับศัพท์ต่างประเทศ\n"
+            "- 'drama_vocab': ศัพท์เฉพาะเรื่อง, สำนวนย้อนยุค, คำโบราณ, ราชาศัพท์, คำเฉพาะกลุ่ม\n"
+            "- 'character': ชื่อตัวละครเด่น, ชื่อบุคคลเฉพาะในบท\n"
+            "กฎเหล็ก:\n"
+            "1. ห้ามเลือกคำไทยสามัญทั่วไปเด็ดขาด (เช่น กิน, นอน, ไป, มา, พูด, ดี, ไม่, ใช่, เธอ, ฉัน)\n"
+            "2. คำต้องสะกดถูกต้อง เป็นอักษรไทยล้วน ความยาว 2-25 ตัวอักษร\n"
+            "3. คัดเลือกเฉพาะคำที่เด่นและมีคุณค่าต่อการตัดคำ 10 - 25 คำ\n"
+            "4. ตอบเป็น JSON Object รูปแบบนี้เท่านั้น ห้ามมีข้อความอื่น:\n"
+            "{\"vocabulary\": [{\"word\": \"คำศัพท์\", \"category\": \"slang|drama_vocab|character\"}]}"
+        )
+
+        user_msg = f"ข้อมูลละครเรื่อง: '{drama_title}'\nบทสนทนาละคร:\n{sampled_text}"
+
+        req_payload = {
+            "model": STAGE1_MODEL,
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0.2, "num_predict": 1024, "num_ctx": 4096},
+            "messages": [
+                {"role": "system", "content": mining_prompt},
+                {"role": "user", "content": user_msg}
+            ]
+        }
+
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/chat",
+            data=json.dumps(req_payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"}
+        )
+
+        with urllib.request.urlopen(req, timeout=90.0) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+            content = resp_data.get("message", {}).get("content", "").strip()
+
+        parsed = {}
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            m = re.search(r'\{.*\}', content, re.DOTALL)
+            if m:
+                parsed = json.loads(m.group(0))
+
+        raw_vocab = parsed.get("vocabulary", [])
+        if not isinstance(raw_vocab, list):
+            return
+
+        valid_words = []
+        seen = set()
+        for item in raw_vocab:
+            if not isinstance(item, dict):
+                continue
+            w = str(item.get("word", "")).strip()
+            cat = str(item.get("category", "slang")).strip().lower()
+            if cat not in ("slang", "drama_vocab", "character"):
+                cat = "slang"
+
+            if not re.match(r'^[\u0E01-\u0E5B]{2,25}$', w):
+                continue
+
+            if w in THAI_STOPWORDS or w in seen:
+                continue
+
+            seen.add(w)
+            valid_words.append({"word": w, "category": cat})
+
+        if not valid_words:
+            return
+
+        sync_payload = json.dumps({
+            "token": "autosub_sec_webhook_2026_9a8b7c",
+            "drama_title": drama_title,
+            "category": "slang",
+            "words": valid_words
+        }, ensure_ascii=False).encode("utf-8")
+
+        for endpoint_url, ep_headers in [
+            ("http://ph.cdnwatch.com/subtitle.php?action=learn_vocab", {"Content-Type": "application/json; charset=utf-8", "User-Agent": "AutoSub-LLM/3.0"}),
+            ("http://23.158.40.152/subtitle.php?action=learn_vocab", {"Content-Type": "application/json; charset=utf-8", "Host": "pl.cdnwatch.com", "User-Agent": "AutoSub-LLM/3.0"})
+        ]:
+            try:
+                sync_req = urllib.request.Request(endpoint_url, data=sync_payload, headers=ep_headers)
+                with urllib.request.urlopen(sync_req, timeout=10.0) as sync_resp:
+                    if sync_resp.status == 200:
+                        res_body = sync_resp.read().decode("utf-8")
+                        logger.info(f"[AUTO-LEARN MINER] Successfully mined & sent {len(valid_words)} words for '{drama_title}' to Storage 17: {res_body[:100]}")
+                        break
+            except Exception as _e:
+                continue
+
+    except Exception as ex:
+        logger.warning(f"[AUTO-LEARN MINER WARN] Vocab mining failed: {ex}")
+
+def trigger_async_vocabulary_mining(drama_title: str, segments: List[dict]):
+    """Fires non-blocking vocabulary mining worker thread after Step 6 refinement."""
+    try:
+        t = threading.Thread(target=_mine_vocab_worker, args=(drama_title, segments), daemon=True)
+        t.start()
+    except Exception as e:
+        logger.warning(f"[AUTO-LEARN MINER WARN] Could not spawn miner thread: {e}")
+
+# ==============================================================================
 # 1. CONTEXTUAL THAI PROOFREADING (Step 6 & 7: 2-Stage Cascade / Modular Endpoints)
 # ==============================================================================
 @app.post("/v1/llm/stage1")
@@ -1066,6 +1211,10 @@ def refine_subtitles(req_data: RefineRequest):
         with total_completed_lock:
             total_completed_jobs += 1
         logger.info(f"Refinement completed: {total_corrected} cues corrected in {dur}s for drama '{drama_title}'.")
+
+        # Option B: Asynchronously mine vocabulary and slang from dialogue cues
+        trigger_async_vocabulary_mining(drama_title, refined_segments)
+
         return {
             "status": "success",
             "pipeline": pipeline_desc,
@@ -1372,6 +1521,9 @@ def _process_async_refine(job: AsyncRefineRequest):
             "pipeline": pipeline_name
         }
         send_webhook_callback(job.webhook_url, webhook_payload)
+
+        # Option B: Asynchronously mine vocabulary and slang from dialogue cues
+        trigger_async_vocabulary_mining(job.drama_title, refined_segments)
 
         with total_completed_lock:
             total_completed_jobs += 1

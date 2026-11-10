@@ -487,7 +487,23 @@ typhoon_enc = WhisperModel.from_pretrained(
     low_cpu_mem_usage=True
 ).encoder.to(device_ctc).eval()
 
-
+# ==========================================
+# 2.5 ENGINE INITIALIZATION: TYPHOON ASR (THAI BASE)
+# ==========================================
+print("Initializing Thai ASR Engine: Typhoon-Whisper-large-v3...")
+from transformers import pipeline as hf_pipeline
+typhoon_asr_pipe = None
+try:
+    typhoon_asr_pipe = hf_pipeline(
+        "automatic-speech-recognition",
+        model=enc_dir,
+        torch_dtype=torch.float16,
+        device=device_gpu0,
+        model_kwargs={"low_cpu_mem_usage": True}
+    )
+    print("Typhoon Whisper large-v3 Thai ASR Pipeline Ready on GPU 0!")
+except Exception as _t_pipe_err:
+    print(f"[WARN] Typhoon ASR Pipeline init notice: {_t_pipe_err}")
 
 ctc_sym2id = {s: i for i, s in enumerate(ctc_symbols)}
 print("Thai Engine (Typhoon + CTC + PyThaiNLP) Ready!")
@@ -1905,27 +1921,62 @@ def transcribe_hybrid_thai(
         else:
             initial_prompt = clean_user_prompt
 
-    # ===== STEP 1: Whisper large-v3 Base Transcription (full coverage) =====
-    current_pipeline_stage.set("Step 1: Faster-Whisper Base Transcription")
-    with WHISPER_SEMAPHORE:
-        base_segments, info = safe_transcribe_segments(
-            whisper_model,
-            wav,
-            language="th",
-            temperature=temperature,
-            beam_size=5,
-            word_timestamps=True,
-            initial_prompt=initial_prompt,
-            hotwords=hotwords,
-            condition_on_previous_text=False,
-            repetition_penalty=1.15,
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.2,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
-        )
+    # ===== STEP 1: Thai Base Transcription (Typhoon Whisper large-v3 SOTA) =====
+    current_pipeline_stage.set("Step 1: Typhoon-Whisper Thai Base Transcription")
+    base_segments = []
+    if typhoon_asr_pipe is not None:
+        with TYPHOON_SEMAPHORE:
+            t_asr0 = time.time()
+            clean_input = {"raw": wav.copy(), "sampling_rate": 16000}
+            res_pipe = typhoon_asr_pipe(
+                clean_input,
+                chunk_length_s=30,
+                stride_length_s=4,
+                return_timestamps=True,
+                generate_kwargs={"language": "th", "task": "transcribe"}
+            )
+            raw_text = res_pipe.get("text", "").strip()
+            log_transcribe(f"[HYBRID TYPHOON] Step 1 done in {time.time()-t_asr0:.2f}s: \"{raw_text[:120]}...\"")
+            chunks = res_pipe.get("chunks", [])
+            if chunks:
+                for c in chunks:
+                    ts = c.get("timestamp", (0.0, total_duration))
+                    s_start = ts[0] if ts[0] is not None else 0.0
+                    s_end = ts[1] if ts[1] is not None else total_duration
+                    base_segments.append(type("Segment", (), {
+                        "start": s_start,
+                        "end": s_end,
+                        "text": c.get("text", "").strip(),
+                        "words": []
+                    })())
+            else:
+                base_segments.append(type("Segment", (), {
+                    "start": 0.0,
+                    "end": total_duration,
+                    "text": raw_text,
+                    "words": []
+                })())
+    else:
+        # Fallback to OpenAI Faster-Whisper if Typhoon ASR pipe is unavailable
+        with WHISPER_SEMAPHORE:
+            base_segments, info = safe_transcribe_segments(
+                whisper_model,
+                wav,
+                language="th",
+                temperature=temperature,
+                beam_size=5,
+                word_timestamps=True,
+                initial_prompt=initial_prompt,
+                hotwords=hotwords,
+                condition_on_previous_text=False,
+                repetition_penalty=1.15,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.2,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=400, threshold=0.25)
+            )
 
-    log_transcribe(f"[HYBRID] Step 1 done: large-v3 produced {len(base_segments)} raw segments")
+    log_transcribe(f"[HYBRID] Step 1 done: produced {len(base_segments)} raw segments")
 
     # Convert wav to torch tensor for CTC alignment
     x_16k = torch.as_tensor(wav, dtype=torch.float32)
@@ -2406,14 +2457,23 @@ def do_transcription_pipeline(
         lang_code = "zh"
     elif raw_lang in ["ko", "korean"]:
         lang_code = "ko"
-    else:
+    elif raw_lang in ["en", "english"]:
+        lang_code = "en"
+    elif raw_lang in ["ja", "japanese"]:
+        lang_code = "ja"
+    elif raw_lang in ["th", "thai"]:
         lang_code = "th"
+    else:
+        lang_code = raw_lang
 
     req_model = (model_name or "hybrid").strip().lower()
     offset_val = 0.0 if time_offset is None else float(time_offset)
 
-    if lang_code in ["zh", "ko"]:
-        engine_label = f"Faster-Whisper (large-v3, Lang: {lang_code}, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
+    if lang_code != "th":
+        # ========================================================
+        # ROUTE 2: MULTILINGUAL GLOBAL PIPELINE (OPENAI WHISPER LARGE-V3)
+        # ========================================================
+        engine_label = f"OpenAI Faster-Whisper (large-v3, Lang: {lang_code}, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         segments, combined_text, audio_dur = transcribe_multilingual(
             tmp_path,
@@ -2425,27 +2485,15 @@ def do_transcription_pipeline(
             hotwords=hotwords
         )
         detected_lang = lang_code
-    elif req_model in ["typhoon", "typhoon-ctc"]:
+    elif req_model in ["typhoon-ctc"]:
+        # Thai CTC Direct
         engine_label = "Typhoon-Whisper-CTC" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         segments, combined_text, audio_dur = transcribe_with_typhoon(tmp_path, isolate_vocals=isolate_vocals, time_offset=offset_val)
         detected_lang = "th"
-    elif req_model in ["large-v3", "large-v3-thai", "turbo"]:
-        engine_label = f"Faster-Whisper (large-v3) + Thai Dialogue Tuning (Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
-        log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
-        initial_prompt = prompt.strip() if prompt and prompt.strip() else None
-        segments, combined_text, audio_dur = transcribe_with_large_v3_thai(
-            tmp_path,
-            initial_prompt=initial_prompt,
-            temperature=temperature,
-            time_offset=offset_val,
-            isolate_vocals=bool(isolate_vocals),
-            hotwords=hotwords
-        )
-        detected_lang = "th"
     else:
-        # Default: Hybrid SOTA Thai (large-v3 + Typhoon CTC Align)
-        engine_label = f"Hybrid (large-v3 + Typhoon CTC Align, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
+        # Default Thai: Hybrid SOTA Thai (Typhoon Whisper large-v3 + Typhoon CTC Align)
+        engine_label = f"Hybrid SOTA Thai (Typhoon-Whisper-large-v3 + CTC Align, Offset: {offset_val}s)" + (" + HDemucs" if isolate_vocals else "")
         log_transcribe(f"[JOB START] ไฟล์: {orig_filename} ({file_size_mb} MB) | ภาษา: {lang_code} | เอนจิน: {engine_label}")
         initial_prompt = prompt.strip() if prompt and prompt.strip() else None
         segments, combined_text, audio_dur = transcribe_hybrid_thai(
@@ -2479,8 +2527,8 @@ def do_transcription_pipeline(
         except Exception as _d_err:
             log_transcribe(f"[DIARIZATION NOTICE] Skipped due to error: {_d_err}")
 
-    # Step 5: Thai Regex & Phonetic Dictionary Corrections
-    if segments:
+    # Step 5: Thai Regex & Phonetic Dictionary Corrections (Thai Only)
+    if lang_code == "th" and segments:
         step5_corrections = 0
         for s in segments:
             orig_t = s["text"]
@@ -2490,9 +2538,9 @@ def do_transcription_pipeline(
                 step5_corrections += 1
         log_transcribe(f"[STEP 5 DICTIONARY] Applied 1,077 Thai rules across {len(segments)} cues ({step5_corrections} cues modified)")
 
-    # Step 6: Contextual Refinement via Fast Local/Remote LLM (Synchronous fallback)
+    # Step 6: Contextual Refinement via Central Master LLM (Thai Only)
     should_refine_step6 = parse_bool_flag(refine_llm, default=True)
-    if should_refine_step6 and segments:
+    if lang_code == "th" and should_refine_step6 and segments:
         try:
             if not known_chars and drama_title:
                 known_chars = get_known_characters(drama_title)
